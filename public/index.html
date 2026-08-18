@@ -73,6 +73,8 @@ const saveOrgConfig = (org, cfg) => api(`/orgs/${encodeURIComponent(org)}/config
 })
 const deleteOrgConfig = (org) => api(`/orgs/${encodeURIComponent(org)}/config`, { method: 'DELETE' })
 const testOrgConfig = (org) => api(`/orgs/${encodeURIComponent(org)}/config/test`, { method: 'POST' })
+const fetchSessionUsage = (org, id) => api(`/orgs/${encodeURIComponent(org)}/sessions/${id}/usage`)
+const fetchUsage = (org, period) => api(`/orgs/${encodeURIComponent(org)}/usage?period=${period}`)
 
 // ─── UTILS ─────────────────────────────────────────────────────────────────
 function timeAgo(dateStr) {
@@ -472,6 +474,7 @@ function SessionDetail({ session, orgAlias, orgObj }) {
   const TABS = [
     { id: 'timeline', label: `Timeline${data ? ` (${data.interactions?.length || 0})` : ''}` },
     { id: 'participants', label: `Participants${data ? ` (${data.participants?.length || 0})` : ''}` },
+    { id: 'usage', label: '📊 Usage' },
     { id: 'raw', label: 'Raw JSON' },
   ]
 
@@ -533,6 +536,7 @@ function SessionDetail({ session, orgAlias, orgObj }) {
               h('span', { className: 'ml-auto text-xs text-gray-600' }, fmtTime(p['ssot__StartTimestamp__c']))
             ))
       ),
+      tab === 'usage' && h(SessionUsageTab, { sessionId: session['ssot__Id__c'], orgAlias }),
       !loading && !error && data && tab === 'raw' && h('div', { className: 'p-4' },
         h('pre', { className: 'text-xs font-mono text-gray-300 bg-gray-950 rounded-lg p-4 overflow-auto' },
           JSON.stringify({ session, ...data }, null, 2)
@@ -661,6 +665,252 @@ function StepRow({ step }) {
       step['ssot__OutputValueText__c'] && h('div', null,
         h('p', { className: 'text-xs text-gray-600 mb-1' }, 'Output'),
         h('pre', { className: 'text-xs text-gray-400 bg-gray-900 rounded p-2 overflow-auto max-h-32' }, prettyJson(step['ssot__OutputValueText__c']))
+      )
+    )
+  )
+}
+
+// ─── USAGE HELPERS ──────────────────────────────────────────────────────────
+
+function usageStats(records) {
+  const calls = records.length
+  const billable = records.filter(r => r.IsBillableIndicator__c).length
+  const metered = records.filter(r => r.IsMeteredIndicator__c).length
+  const inputTokens = records.reduce((s, r) => s + (r.PromptInputTokenCount__c || 0), 0)
+  const completionTokens = records.reduce((s, r) => s + (r.PromptCompletionTokenCount__c || 0), 0)
+  const totalTokens = records.reduce((s, r) => s + (r.PromptTotalTokenCount__c || r.PromptInputTokenCount__c + r.PromptCompletionTokenCount__c || 0), 0)
+
+  const byModel = {}
+  for (const r of records) {
+    const model = r.ModelProviderModelName__c || r.GenAiGatewayModelName__c || 'Unknown'
+    if (!byModel[model]) byModel[model] = { calls: 0, inputTokens: 0, completionTokens: 0, totalTokens: 0, billable: 0 }
+    byModel[model].calls++
+    byModel[model].inputTokens += r.PromptInputTokenCount__c || 0
+    byModel[model].completionTokens += r.PromptCompletionTokenCount__c || 0
+    byModel[model].totalTokens += r.PromptTotalTokenCount__c || 0
+    if (r.IsBillableIndicator__c) byModel[model].billable++
+  }
+
+  const byAgent = {}
+  for (const r of records) {
+    const agent = r.AgentDeveloperName__c || 'Unknown'
+    if (!byAgent[agent]) byAgent[agent] = { calls: 0, totalTokens: 0 }
+    byAgent[agent].calls++
+    byAgent[agent].totalTokens += r.PromptTotalTokenCount__c || 0
+  }
+
+  return { calls, billable, metered, inputTokens, completionTokens, totalTokens, byModel, byAgent }
+}
+
+function StatCard({ label, value, sub, accent }) {
+  const color = accent === 'green' ? 'text-green-400' : accent === 'blue' ? 'text-blue-400' : accent === 'purple' ? 'text-purple-400' : 'text-gray-200'
+  return h('div', { className: 'card px-4 py-3' },
+    h('p', { className: 'text-xs text-gray-500 mb-1' }, label),
+    h('p', { className: `text-xl font-bold tabular-nums ${color}` }, typeof value === 'number' ? value.toLocaleString() : value),
+    sub && h('p', { className: 'text-xs text-gray-600 mt-0.5' }, sub)
+  )
+}
+
+function ModelBar({ model, data, maxTokens }) {
+  const pct = maxTokens > 0 ? Math.round((data.totalTokens / maxTokens) * 100) : 0
+  return h('div', { className: 'space-y-1' },
+    h('div', { className: 'flex items-center justify-between text-xs' },
+      h('span', { className: 'text-gray-300 font-medium truncate flex-1 mr-4' }, model),
+      h('span', { className: 'text-gray-500 tabular-nums flex-shrink-0' },
+        `${data.totalTokens.toLocaleString()} tokens · ${data.calls} calls`)
+    ),
+    h('div', { className: 'h-1.5 bg-gray-800 rounded-full overflow-hidden' },
+      h('div', { className: 'h-full bg-purple-600 rounded-full transition-all', style: { width: `${pct}%` } })
+    ),
+    h('div', { className: 'flex gap-3 text-[10px] text-gray-600' },
+      h('span', null, `↑ ${(data.inputTokens || 0).toLocaleString()} in`),
+      h('span', null, `↓ ${(data.completionTokens || 0).toLocaleString()} out`),
+      data.billable > 0 && h('span', { className: 'text-teal-700' }, `${data.billable} billable`)
+    )
+  )
+}
+
+// ─── SESSION USAGE TAB ───────────────────────────────────────────────────────
+
+function SessionUsageTab({ sessionId, orgAlias }) {
+  const [data, setData] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState(null)
+
+  useEffect(() => {
+    if (!sessionId || !orgAlias) return
+    setLoading(true); setData(null); setError(null)
+    fetchSessionUsage(orgAlias, sessionId)
+      .then(r => { setData(r.records || []); setLoading(false) })
+      .catch(e => { setError(e.message); setLoading(false) })
+  }, [sessionId, orgAlias])
+
+  if (loading) return h('div', { className: 'flex items-center justify-center h-40 text-gray-500' }, 'Loading usage…')
+  if (error) return h('div', { className: 'm-4 p-3 bg-red-900/20 border border-red-800 rounded-lg text-red-400 text-sm' }, `⚠ ${error}`)
+  if (!data) return null
+  if (data.length === 0) return h('div', { className: 'flex items-center justify-center h-40 text-gray-600 text-sm' }, 'No usage records for this session')
+
+  const stats = usageStats(data)
+  const models = Object.entries(stats.byModel).sort((a, b) => b[1].totalTokens - a[1].totalTokens)
+  const maxModelTokens = models[0]?.[1].totalTokens ?? 1
+
+  return h('div', { className: 'p-4 space-y-5' },
+    // Summary cards
+    h('div', { className: 'grid grid-cols-2 gap-2 sm:grid-cols-4' },
+      h(StatCard, { label: 'Total tokens', value: stats.totalTokens, sub: `↑ ${stats.inputTokens.toLocaleString()} in · ↓ ${stats.completionTokens.toLocaleString()} out`, accent: 'purple' }),
+      h(StatCard, { label: 'LLM calls', value: stats.calls, accent: 'blue' }),
+      h(StatCard, { label: 'Billable calls', value: stats.billable, sub: stats.calls > 0 ? `${Math.round(stats.billable / stats.calls * 100)}% of calls` : null, accent: 'green' }),
+      h(StatCard, { label: 'Metered', value: stats.metered })
+    ),
+
+    // By model
+    models.length > 0 && h('div', { className: 'card p-4 space-y-3' },
+      h('p', { className: 'text-xs font-medium text-gray-400 mb-3' }, 'By model'),
+      ...models.map(([model, d]) => h(ModelBar, { key: model, model, data: d, maxTokens: maxModelTokens }))
+    ),
+
+    // Per-call table
+    h('div', { className: 'card overflow-hidden' },
+      h('p', { className: 'text-xs font-medium text-gray-400 px-4 py-2.5 border-b border-gray-800' }, `All usage records (${data.length})`),
+      h('div', { className: 'overflow-x-auto' },
+        h('table', { className: 'w-full text-xs' },
+          h('thead', null,
+            h('tr', { className: 'border-b border-gray-800 text-gray-500' },
+              ['Time', 'Model', 'In', 'Out', 'Total', 'Type', 'Billable'].map(col =>
+                h('th', { key: col, className: 'px-3 py-2 text-left font-medium whitespace-nowrap' }, col)
+              )
+            )
+          ),
+          h('tbody', null,
+            data.map((r, i) => h('tr', { key: r.Id__c || i, className: 'border-b border-gray-800/50 hover:bg-gray-800/30' },
+              h('td', { className: 'px-3 py-2 text-gray-500 whitespace-nowrap' }, fmtTime(r.Timestamp__c)),
+              h('td', { className: 'px-3 py-2 text-gray-300 font-mono text-[10px]' }, r.ModelProviderModelName__c || r.GenAiGatewayModelName__c || '—'),
+              h('td', { className: 'px-3 py-2 text-gray-400 tabular-nums' }, (r.PromptInputTokenCount__c || 0).toLocaleString()),
+              h('td', { className: 'px-3 py-2 text-gray-400 tabular-nums' }, (r.PromptCompletionTokenCount__c || 0).toLocaleString()),
+              h('td', { className: 'px-3 py-2 text-purple-400 tabular-nums font-medium' }, (r.PromptTotalTokenCount__c || 0).toLocaleString()),
+              h('td', { className: 'px-3 py-2 text-gray-500' }, r.UsageTypeCode__c || '—'),
+              h('td', { className: 'px-3 py-2' },
+                r.IsBillableIndicator__c
+                  ? h('span', { className: 'text-teal-400' }, '✓')
+                  : h('span', { className: 'text-gray-700' }, r.MeteringSkipReasonCode__c || '—')
+              )
+            ))
+          )
+        )
+      )
+    )
+  )
+}
+
+// ─── ANALYTICS PANE ─────────────────────────────────────────────────────────
+
+function AnalyticsPane({ orgAlias }) {
+  const [period, setPeriod] = useState('7d')
+  const [data, setData] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState(null)
+
+  useEffect(() => {
+    if (!orgAlias) return
+    setLoading(true); setData(null); setError(null)
+    fetchUsage(orgAlias, period)
+      .then(r => { setData(r.records || []); setLoading(false) })
+      .catch(e => { setError(e.message); setLoading(false) })
+  }, [orgAlias, period])
+
+  const PERIODS = [{ id: '24h', label: 'Last 24h' }, { id: '7d', label: 'Last 7 days' }, { id: '30d', label: 'Last 30 days' }]
+
+  const stats = data ? usageStats(data) : null
+
+  // Group by day for timeline
+  const byDay = {}
+  if (data) {
+    for (const r of data) {
+      const day = (r.Timestamp__c || '').slice(0, 10)
+      if (!day) continue
+      if (!byDay[day]) byDay[day] = { totalTokens: 0, calls: 0, billable: 0 }
+      byDay[day].totalTokens += r.PromptTotalTokenCount__c || 0
+      byDay[day].calls++
+      if (r.IsBillableIndicator__c) byDay[day].billable++
+    }
+  }
+  const days = Object.entries(byDay).sort((a, b) => a[0].localeCompare(b[0]))
+  const maxDayTokens = days.reduce((m, [, d]) => Math.max(m, d.totalTokens), 1)
+
+  const models = stats ? Object.entries(stats.byModel).sort((a, b) => b[1].totalTokens - a[1].totalTokens) : []
+  const maxModelTokens = models[0]?.[1].totalTokens ?? 1
+  const agents = stats ? Object.entries(stats.byAgent).sort((a, b) => b[1].totalTokens - a[1].totalTokens) : []
+
+  // Unique session count
+  const sessionSet = data ? new Set(data.map(r => r.AiAgentSessionId__c).filter(Boolean)) : new Set()
+
+  return h('div', { className: 'flex flex-col h-full overflow-hidden' },
+    // Header
+    h('div', { className: 'px-5 py-3 border-b border-gray-800 flex-shrink-0 flex items-center gap-3' },
+      h('h2', { className: 'text-sm font-semibold' }, 'Usage & Cost'),
+      h('div', { className: 'flex gap-1 ml-4' },
+        PERIODS.map(p => h('button', {
+          key: p.id, onClick: () => setPeriod(p.id),
+          className: `px-2.5 py-1 rounded text-xs font-medium transition-colors ${period === p.id ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800'}`
+        }, p.label))
+      ),
+      loading && h('span', { className: 'text-xs text-gray-500 ml-2' }, 'Loading…')
+    ),
+
+    h('div', { className: 'flex-1 overflow-y-auto p-5 space-y-5' },
+      error && h('div', { className: 'p-3 bg-red-900/20 border border-red-800 rounded-lg text-red-400 text-sm' }, `⚠ ${error}`),
+
+      !loading && !error && stats && h(React.Fragment, null,
+        // Summary cards
+        h('div', { className: 'grid grid-cols-2 gap-3 lg:grid-cols-5' },
+          h(StatCard, { label: 'Sessions', value: sessionSet.size, accent: 'blue' }),
+          h(StatCard, { label: 'LLM calls', value: stats.calls, accent: 'blue' }),
+          h(StatCard, { label: 'Total tokens', value: stats.totalTokens, sub: `↑ ${stats.inputTokens.toLocaleString()} · ↓ ${stats.completionTokens.toLocaleString()}`, accent: 'purple' }),
+          h(StatCard, { label: 'Billable calls', value: stats.billable, sub: stats.calls > 0 ? `${Math.round(stats.billable / stats.calls * 100)}%` : null, accent: 'green' }),
+          h(StatCard, { label: 'Non-metered', value: stats.calls - stats.metered, sub: stats.metered > 0 ? `${stats.metered} metered` : null })
+        ),
+
+        // Token timeline
+        days.length > 1 && h('div', { className: 'card p-4' },
+          h('p', { className: 'text-xs font-medium text-gray-400 mb-3' }, 'Tokens by day'),
+          h('div', { className: 'space-y-2' },
+            days.map(([day, d]) => {
+              const pct = Math.round((d.totalTokens / maxDayTokens) * 100)
+              return h('div', { key: day, className: 'flex items-center gap-3' },
+                h('span', { className: 'text-[10px] text-gray-600 w-20 flex-shrink-0' }, day.slice(5)),
+                h('div', { className: 'flex-1 h-4 bg-gray-800 rounded overflow-hidden' },
+                  h('div', { className: 'h-full bg-blue-700 rounded transition-all flex items-center pl-2', style: { width: `${Math.max(pct, 2)}%` } },
+                    pct > 15 && h('span', { className: 'text-[9px] text-blue-200 whitespace-nowrap' }, d.totalTokens.toLocaleString())
+                  )
+                ),
+                h('span', { className: 'text-[10px] text-gray-600 w-16 text-right flex-shrink-0' }, `${d.calls} calls`)
+              )
+            })
+          )
+        ),
+
+        // By model
+        models.length > 0 && h('div', { className: 'card p-4 space-y-3' },
+          h('p', { className: 'text-xs font-medium text-gray-400 mb-3' }, 'By model'),
+          ...models.map(([model, d]) => h(ModelBar, { key: model, model, data: d, maxTokens: maxModelTokens }))
+        ),
+
+        // By agent
+        agents.length > 0 && h('div', { className: 'card p-4' },
+          h('p', { className: 'text-xs font-medium text-gray-400 mb-3' }, 'By agent'),
+          h('div', { className: 'space-y-2' },
+            agents.map(([agent, d]) => {
+              const pct = stats.totalTokens > 0 ? Math.round(d.totalTokens / stats.totalTokens * 100) : 0
+              return h('div', { key: agent, className: 'flex items-center gap-3 text-xs' },
+                h('span', { className: 'text-gray-300 font-mono w-48 truncate flex-shrink-0' }, agent),
+                h('div', { className: 'flex-1 h-1.5 bg-gray-800 rounded-full overflow-hidden' },
+                  h('div', { className: 'h-full bg-teal-600 rounded-full', style: { width: `${pct}%` } })
+                ),
+                h('span', { className: 'text-gray-500 tabular-nums w-24 text-right flex-shrink-0' }, `${d.totalTokens.toLocaleString()} · ${d.calls} calls`)
+              )
+            })
+          )
+        )
       )
     )
   )
@@ -803,6 +1053,7 @@ function App() {
 
   const TABS = [
     { id: 'sessions', label: '📋 Sessions' },
+    { id: 'analytics', label: '📊 Analytics' },
     { id: 'query', label: '🔍 Query' },
   ]
 
@@ -861,15 +1112,25 @@ function App() {
               h(SessionDetail, { session: selectedSession, orgAlias, orgObj: selectedOrg })
             )
           )
-        : h('div', { className: 'flex-1 overflow-hidden' },
-            noConfig
-              ? h('div', { className: 'flex flex-col items-center justify-center h-full text-center p-6' },
-                  h('p', { className: 'text-3xl mb-3' }, '🔑'),
-                  h('p', { className: 'text-sm font-medium mb-1' }, 'Data 360 not configured'),
-                  h('button', { onClick: () => setShowConfig(true), className: 'mt-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-sm font-medium' }, 'Configure now')
-                )
-              : h(QueryPane, { orgAlias })
-          )
+        : tab === 'analytics'
+          ? h('div', { className: 'flex-1 overflow-hidden' },
+              noConfig
+                ? h('div', { className: 'flex flex-col items-center justify-center h-full text-center p-6' },
+                    h('p', { className: 'text-3xl mb-3' }, '🔑'),
+                    h('p', { className: 'text-sm font-medium mb-1' }, 'Data 360 not configured'),
+                    h('button', { onClick: () => setShowConfig(true), className: 'mt-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-sm font-medium' }, 'Configure now')
+                  )
+                : h(AnalyticsPane, { orgAlias })
+            )
+          : h('div', { className: 'flex-1 overflow-hidden' },
+              noConfig
+                ? h('div', { className: 'flex flex-col items-center justify-center h-full text-center p-6' },
+                    h('p', { className: 'text-3xl mb-3' }, '🔑'),
+                    h('p', { className: 'text-sm font-medium mb-1' }, 'Data 360 not configured'),
+                    h('button', { onClick: () => setShowConfig(true), className: 'mt-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-sm font-medium' }, 'Configure now')
+                  )
+                : h(QueryPane, { orgAlias })
+            )
   )
 }
 

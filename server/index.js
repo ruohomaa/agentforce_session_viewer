@@ -322,6 +322,42 @@ app.get('/api/orgs/:org/interactions/:id/messages', async (req, res) => {
   } catch (err) { handleDcError(err, res) }
 })
 
+const USAGE_FIELDS = `Id__c, AiAgentSessionId__c, AiAgentInteractionId__c, Timestamp__c,
+              IsBillableIndicator__c, IsMeteredIndicator__c, MeteringSkipReasonCode__c,
+              PromptInputTokenCount__c, PromptCompletionTokenCount__c, PromptTotalTokenCount__c,
+              UsageQuantity__c, UsageTypeCode__c, UnitTypeCode__c,
+              ModelProviderName__c, ModelProviderModelName__c, GenAiGatewayModelName__c,
+              GenAiGatewayFeatureName__c, TierQualifierType__c, AgentDeveloperName__c`
+
+app.get('/api/orgs/:org/sessions/:sessionId/usage', async (req, res) => {
+  const { org, sessionId } = req.params
+  try {
+    const result = await dcQueryAll(org,
+      `SELECT ${USAGE_FIELDS}
+       FROM AiAgentGenerativeAiUsage_std__dlm
+       WHERE AiAgentSessionId__c = '${sessionId}'
+       ORDER BY Timestamp__c ASC`
+    )
+    res.json(result)
+  } catch (err) { handleDcError(err, res) }
+})
+
+app.get('/api/orgs/:org/usage', async (req, res) => {
+  const { org } = req.params
+  const { period = '7d' } = req.query
+  const periodMs = { '24h': 86400_000, '7d': 7 * 86400_000, '30d': 30 * 86400_000 }[period] ?? 7 * 86400_000
+  const since = new Date(Date.now() - periodMs).toISOString().replace('T', ' ').replace('Z', '')
+  try {
+    const result = await dcQueryAll(org,
+      `SELECT ${USAGE_FIELDS}
+       FROM AiAgentGenerativeAiUsage_std__dlm
+       WHERE Timestamp__c >= TIMESTAMP '${since}'
+       ORDER BY Timestamp__c DESC`
+    )
+    res.json(result)
+  } catch (err) { handleDcError(err, res) }
+})
+
 app.post('/api/orgs/:org/query', async (req, res) => {
   const { query } = req.body
   if (!query) return res.status(400).json({ error: 'query is required' })
