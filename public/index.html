@@ -1,0 +1,879 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agentforce Session Viewer</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            sf: {
+              blue: '#0176d3',
+              'blue-dark': '#014486',
+              'blue-light': '#1b96ff',
+              navy: '#032d60',
+              teal: '#06a59a',
+              orange: '#fe9339',
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    body { background: #030712; color: #f9fafb; font-family: system-ui, sans-serif; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #111827; }
+    ::-webkit-scrollbar-thumb { background: #374151; border-radius: 9999px; }
+    .card { background: #111827; border: 1px solid #1f2937; border-radius: 0.5rem; }
+    .badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 9999px; font-size: 11px; font-weight: 500; }
+    pre { white-space: pre-wrap; word-break: break-all; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18.2.0",
+    "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+    "react/jsx-runtime": "https://esm.sh/react@18.2.0/jsx-runtime"
+  }
+}
+</script>
+
+<script type="module">
+import React, { useState, useEffect, useCallback, useRef } from 'react'
+import { createRoot } from 'react-dom/client'
+
+const h = React.createElement
+
+// ─── API ───────────────────────────────────────────────────────────────────
+async function api(path, opts = {}) {
+  const r = await fetch('/api' + path, opts)
+  const body = await r.json().catch(() => ({}))
+  if (!r.ok) throw Object.assign(new Error(body.message || body.error || r.statusText), { code: body.error, status: r.status })
+  return body
+}
+const fetchOrgs = () => api('/orgs')
+const fetchSessions = (org, limit = 50) => api(`/orgs/${encodeURIComponent(org)}/sessions?limit=${limit}`)
+const fetchSessionFull = (org, id) => api(`/orgs/${encodeURIComponent(org)}/sessions/${id}/full`)
+const fetchSteps = (org, id) => api(`/orgs/${encodeURIComponent(org)}/interactions/${id}/steps`)
+const fetchMessages = (org, id) => api(`/orgs/${encodeURIComponent(org)}/interactions/${id}/messages`)
+const runQuery = (org, query) => api(`/orgs/${encodeURIComponent(org)}/query`, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query })
+})
+const fetchOrgConfig = (org) => api(`/orgs/${encodeURIComponent(org)}/config`)
+const saveOrgConfig = (org, cfg) => api(`/orgs/${encodeURIComponent(org)}/config`, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg)
+})
+const deleteOrgConfig = (org) => api(`/orgs/${encodeURIComponent(org)}/config`, { method: 'DELETE' })
+const testOrgConfig = (org) => api(`/orgs/${encodeURIComponent(org)}/config/test`, { method: 'POST' })
+
+// ─── UTILS ─────────────────────────────────────────────────────────────────
+function timeAgo(dateStr) {
+  if (!dateStr) return '—'
+  const diff = Date.now() - new Date(dateStr)
+  const s = Math.round(diff / 1000)
+  if (s < 60) return `${s}s ago`
+  if (s < 3600) return `${Math.round(s / 60)}m ago`
+  if (s < 86400) return `${Math.round(s / 3600)}h ago`
+  return `${Math.round(s / 86400)}d ago`
+}
+function fmtTime(dateStr) {
+  if (!dateStr) return '—'
+  return new Date(dateStr).toLocaleTimeString('en-GB', { hour12: false })
+}
+function fmtDate(dateStr) {
+  if (!dateStr) return '—'
+  return new Date(dateStr).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'medium' })
+}
+function duration(ms) {
+  if (!ms) return null
+  return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`
+}
+function statusClass(s) {
+  if (!s) return 'badge' + ' bg-gray-800 text-gray-400'
+  const sl = s.toLowerCase()
+  if (sl.includes('complet') || sl.includes('ended') || sl === 'success') return 'badge bg-green-900/60 text-green-400 border border-green-800'
+  if (sl.includes('active') || sl.includes('progress') || sl.includes('pending')) return 'badge bg-blue-900/60 text-blue-400 border border-blue-800'
+  if (sl.includes('error') || sl.includes('fail')) return 'badge bg-red-900/60 text-red-400 border border-red-800'
+  return 'badge bg-gray-800 text-gray-400'
+}
+function prettyJson(s) {
+  if (!s) return ''
+  try { return JSON.stringify(JSON.parse(s), null, 2) } catch { return s }
+}
+
+// ─── CREDENTIALS MODAL ─────────────────────────────────────────────────────
+
+const SANDBOX_LOGIN = 'https://test.salesforce.com'
+
+function SetupInstructions() {
+  const [showCert, setShowCert] = useState(false)
+  const [showKey, setShowKey] = useState(false)
+
+  const code = txt => h('code', { className: 'block bg-gray-950 border border-gray-800 rounded px-2 py-1.5 font-mono text-gray-300 select-all whitespace-pre text-[10px] leading-relaxed mt-1' }, txt)
+
+  return h('div', { className: 'mx-5 mt-4 space-y-2 text-xs' },
+    // Main steps
+    h('div', { className: 'p-3 bg-blue-900/20 border border-blue-800/40 rounded-lg text-blue-300 space-y-1' },
+      h('p', { className: 'font-medium text-blue-200 mb-1.5' }, '📋 Setup steps'),
+      h('ol', { className: 'list-decimal list-inside space-y-1 text-blue-300/80' },
+        h('li', null, 'Setup → App Manager → New External Client App (JWT Bearer flow)'),
+        h('li', null, 'Add scopes: cdp_query_api, cdp_profile_api, refresh_token, api'),
+        h('li', null, 'Generate a certificate and upload the .crt file to the app'),
+        h('li', null, 'Setup → Connected Apps → Manage → set Permitted Users to pre-authorized'),
+        h('li', null, 'Paste the Consumer Key and private key below')
+      )
+    ),
+
+    // Certificate generation
+    h('div', { className: 'border border-gray-800 rounded-lg overflow-hidden' },
+      h('button', {
+        onClick: () => setShowCert(v => !v),
+        className: 'w-full flex items-center justify-between px-3 py-2 text-xs font-medium text-gray-300 hover:bg-gray-800/50 text-left'
+      },
+        h('span', null, '🔐 How to generate a self-signed certificate'),
+        h('span', { className: 'text-gray-500 text-[10px]' }, showCert ? '▲ hide' : '▼ show')
+      ),
+      showCert && h('div', { className: 'px-3 pb-3 space-y-2 text-gray-400 bg-gray-900/40' },
+        h('p', null, 'Run these three commands in your terminal. You will need OpenSSL (pre-installed on macOS/Linux).'),
+        h('p', { className: 'text-gray-500 mt-2 mb-0.5' }, '1. Generate the private key:'),
+        code('openssl genrsa -out server.key 2048'),
+        h('p', { className: 'text-gray-500 mt-2 mb-0.5' }, '2. Create a certificate signing request (you can press Enter for all prompts):'),
+        code('openssl req -new -key server.key -out server.csr'),
+        h('p', { className: 'text-gray-500 mt-2 mb-0.5' }, '3. Self-sign the certificate (valid 5 years):'),
+        code('openssl x509 -req -sha256 -days 1825 -in server.csr -signkey server.key -out server.crt'),
+        h('p', { className: 'mt-2' },
+          h('span', { className: 'text-amber-400 font-medium' }, '→ Upload server.crt '),
+          'to the Connected App in Salesforce. ',
+          h('span', { className: 'text-amber-400 font-medium' }, 'Paste server.key '),
+          'below (never share this file).'
+        )
+      )
+    ),
+
+    // How to paste the private key
+    h('div', { className: 'border border-gray-800 rounded-lg overflow-hidden' },
+      h('button', {
+        onClick: () => setShowKey(v => !v),
+        className: 'w-full flex items-center justify-between px-3 py-2 text-xs font-medium text-gray-300 hover:bg-gray-800/50 text-left'
+      },
+        h('span', null, '🗝 How to paste the private key'),
+        h('span', { className: 'text-gray-500 text-[10px]' }, showKey ? '▲ hide' : '▼ show')
+      ),
+      showKey && h('div', { className: 'px-3 pb-3 space-y-2 text-gray-400 bg-gray-900/40' },
+        h('p', null, 'Open ', h('code', { className: 'bg-gray-800 px-1 rounded' }, 'server.key'), ' in a text editor and copy the entire contents — including the header and footer lines.'),
+        h('p', { className: 'text-gray-500 mt-1' }, 'It should look like this:'),
+        code('-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA1234...\n... (many lines) ...\n-----END RSA PRIVATE KEY-----'),
+        h('ul', { className: 'list-disc list-inside mt-2 space-y-1' },
+          h('li', null, h('span', { className: 'text-red-400' }, 'Do NOT paste server.csr'), ' — that is the signing request, not the key'),
+          h('li', null, h('span', { className: 'text-red-400' }, 'Do NOT paste server.crt'), ' — that is the certificate you uploaded to Salesforce'),
+          h('li', null, 'Alternatively, enter the absolute file path to server.key instead of pasting')
+        ),
+        h('p', { className: 'mt-2 text-gray-500' }, 'Quick copy command (macOS):'),
+        code('cat server.key | pbcopy')
+      )
+    )
+  )
+}
+const PROD_LOGIN    = 'https://login.salesforce.com'
+
+function CredentialsModal({ org, onClose, onSaved }) {
+  const [existing, setExisting] = useState(null)
+  const [form, setForm] = useState({ consumerKey: '', privateKey: '', loginUrl: SANDBOX_LOGIN, username: '' })
+  const [saving, setSaving] = useState(false)
+  const [testing, setTesting] = useState(false)
+  const [testResult, setTestResult] = useState(null)
+  const [error, setError] = useState(null)
+
+  useEffect(() => {
+    if (!org) return
+    const key = org.alias || org.username
+    fetchOrgConfig(key).then(cfg => {
+      setExisting(cfg)
+      if (cfg.configured) {
+        setForm(f => ({
+          ...f,
+          consumerKey: cfg.consumerKey || '',
+          loginUrl: cfg.loginUrl || (org.isSandbox ? SANDBOX_LOGIN : PROD_LOGIN),
+          username: cfg.username || org.username || '',
+        }))
+      } else {
+        setForm(f => ({
+          ...f,
+          loginUrl: org.isSandbox ? SANDBOX_LOGIN : PROD_LOGIN,
+          username: org.username || '',
+        }))
+      }
+    }).catch(() => {})
+  }, [org?.alias, org?.username])
+
+  const orgKey = org ? (org.alias || org.username) : ''
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }))
+
+  async function handleSave() {
+    setError(null); setSaving(true)
+    try {
+      await saveOrgConfig(orgKey, form)
+      setSaving(false)
+      onSaved()
+      onClose()
+    } catch (e) { setError(e.message); setSaving(false) }
+  }
+
+  async function handleTest() {
+    setError(null); setTestResult(null); setTesting(true)
+    try {
+      await saveOrgConfig(orgKey, form)
+      const r = await testOrgConfig(orgKey)
+      setTestResult({ ok: true, msg: `Connected ✓  DC tenant: ${r.instanceUrl}` })
+    } catch (e) { setTestResult({ ok: false, msg: e.message }) }
+    setTesting(false)
+  }
+
+  async function handleDelete() {
+    await deleteOrgConfig(orgKey)
+    onSaved()
+    onClose()
+  }
+
+  return h('div', {
+    className: 'fixed inset-0 z-50 flex items-center justify-center bg-black/70',
+    onClick: e => { if (e.target === e.currentTarget) onClose() }
+  },
+    h('div', { className: 'card w-full max-w-xl mx-4 shadow-2xl overflow-hidden' },
+      // Header
+      h('div', { className: 'flex items-center justify-between px-5 py-4 border-b border-gray-800' },
+        h('div', null,
+          h('h2', { className: 'font-semibold text-sm' }, 'Data 360 — Connected App'),
+          h('p', { className: 'text-xs text-gray-400 mt-0.5' }, `${org?.name || orgKey} · ${orgKey}`)
+        ),
+        h('button', { onClick: onClose, className: 'text-gray-500 hover:text-gray-300 text-lg leading-none' }, '✕')
+      ),
+
+      // Instructions
+      h(SetupInstructions, null),
+
+      // Form
+      h('div', { className: 'px-5 py-4 space-y-4' },
+        // Consumer Key
+        h('div', null,
+          h('label', { className: 'block text-xs font-medium text-gray-400 mb-1' }, 'Consumer Key (Client ID)'),
+          h('input', {
+            type: 'text', value: form.consumerKey, onChange: e => set('consumerKey', e.target.value),
+            placeholder: '3MVG9...',
+            className: 'w-full bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-blue-500'
+          })
+        ),
+
+        // Username
+        h('div', null,
+          h('label', { className: 'block text-xs font-medium text-gray-400 mb-1' }, 'Salesforce Username'),
+          h('input', {
+            type: 'text', value: form.username, onChange: e => set('username', e.target.value),
+            placeholder: 'user@example.com',
+            className: 'w-full bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-blue-500'
+          })
+        ),
+
+        // Login URL
+        h('div', null,
+          h('label', { className: 'block text-xs font-medium text-gray-400 mb-1' }, 'Login URL'),
+          h('div', { className: 'flex gap-2' },
+            h('button', {
+              onClick: () => set('loginUrl', SANDBOX_LOGIN),
+              className: `flex-1 py-2 rounded-lg text-xs font-medium border transition-colors ${form.loginUrl === SANDBOX_LOGIN ? 'bg-blue-900/40 border-blue-600 text-blue-300' : 'bg-gray-900 border-gray-700 text-gray-400 hover:border-gray-600'}`
+            }, 'Sandbox (test.salesforce.com)'),
+            h('button', {
+              onClick: () => set('loginUrl', PROD_LOGIN),
+              className: `flex-1 py-2 rounded-lg text-xs font-medium border transition-colors ${form.loginUrl === PROD_LOGIN ? 'bg-blue-900/40 border-blue-600 text-blue-300' : 'bg-gray-900 border-gray-700 text-gray-400 hover:border-gray-600'}`
+            }, 'Production (login.salesforce.com)')
+          )
+        ),
+
+        // Private Key
+        h('div', null,
+          h('label', { className: 'block text-xs font-medium text-gray-400 mb-1' },
+            'Private Key ',
+            h('span', { className: 'text-gray-600 font-normal' }, '— the .key file (not .csr or .crt)')
+          ),
+          h('textarea', {
+            value: form.privateKey, onChange: e => set('privateKey', e.target.value),
+            rows: 5,
+            placeholder: '-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----\n\nPaste server.key content, or enter its absolute file path.\nDo NOT paste server.csr or server.crt.',
+            className: 'w-full bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:border-blue-500 resize-none'
+          })
+        ),
+
+        // Test result
+        testResult && h('div', { className: `p-2.5 rounded-lg text-xs ${testResult.ok ? 'bg-green-900/20 border border-green-800 text-green-400' : 'bg-red-900/20 border border-red-800 text-red-400'}` },
+          testResult.msg
+        ),
+        error && h('div', { className: 'p-2.5 rounded-lg text-xs bg-red-900/20 border border-red-800 text-red-400' }, error),
+      ),
+
+      // Footer
+      h('div', { className: 'flex items-center justify-between px-5 py-3 border-t border-gray-800 bg-gray-900/50' },
+        h('div', { className: 'flex gap-2' },
+          existing?.configured && h('button', {
+            onClick: handleDelete,
+            className: 'text-xs text-red-400 hover:text-red-300 px-2 py-1.5'
+          }, 'Remove credentials')
+        ),
+        h('div', { className: 'flex gap-2' },
+          h('button', {
+            onClick: handleTest, disabled: testing || !form.consumerKey || !form.privateKey,
+            className: 'px-3 py-1.5 rounded-md text-xs bg-gray-800 hover:bg-gray-700 text-gray-300 disabled:opacity-40 border border-gray-700'
+          }, testing ? 'Testing…' : 'Test connection'),
+          h('button', {
+            onClick: handleSave, disabled: saving || !form.consumerKey || !form.privateKey,
+            className: 'px-3 py-1.5 rounded-md text-xs bg-blue-600 hover:bg-blue-700 text-white font-medium disabled:opacity-40'
+          }, saving ? 'Saving…' : 'Save')
+        )
+      )
+    )
+  )
+}
+
+// ─── ORG SELECTOR ──────────────────────────────────────────────────────────
+function OrgSelector({ orgs, selected, onSelect, loading }) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef(null)
+  useEffect(() => {
+    const fn = e => { if (ref.current && !ref.current.contains(e.target)) setOpen(false) }
+    document.addEventListener('mousedown', fn)
+    return () => document.removeEventListener('mousedown', fn)
+  }, [])
+
+  const label = loading ? 'Loading orgs…' : selected ? (selected.alias || selected.username) : 'Select org'
+  const connected = orgs.filter(o => o.connectedStatus === 'Connected')
+  const disconnected = orgs.filter(o => o.connectedStatus !== 'Connected')
+
+  return h('div', { className: 'relative', ref },
+    h('button', {
+      onClick: () => setOpen(v => !v),
+      className: 'flex items-center gap-2 px-3 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 border border-gray-700 text-sm min-w-52 transition-colors'
+    },
+      h('span', { className: 'text-blue-400' }, '🏢'),
+      h('span', { className: 'flex-1 text-left truncate font-medium' }, label),
+      h('span', { className: 'text-gray-400 text-xs' }, loading ? '…' : open ? '▲' : '▼')
+    ),
+    open && h('div', { className: 'absolute top-full mt-1 right-0 z-50 w-96 card shadow-2xl overflow-hidden' },
+      connected.length > 0 && h('div', null,
+        h('div', { className: 'px-3 py-2 border-b border-gray-800' },
+          h('p', { className: 'text-xs text-gray-500' }, 'Connected')
+        ),
+        connected.map(o => OrgItem({ o, selected, onSelect: () => { onSelect(o); setOpen(false) } }))
+      ),
+      disconnected.length > 0 && h('div', null,
+        h('div', { className: 'px-3 py-2 border-b border-gray-800 mt-1' },
+          h('p', { className: 'text-xs text-gray-500' }, 'Disconnected')
+        ),
+        disconnected.map(o => OrgItem({ o, selected, onSelect: () => { onSelect(o); setOpen(false) } }))
+      )
+    )
+  )
+}
+
+function OrgItem({ o, selected, onSelect }) {
+  const isSelected = selected?.username === o.username
+  const ok = o.connectedStatus === 'Connected'
+  return h('button', {
+    key: o.username,
+    onClick: onSelect,
+    className: `w-full text-left px-3 py-2.5 hover:bg-gray-800 transition-colors flex items-start gap-3 ${isSelected ? 'bg-gray-800/80' : ''}`
+  },
+    h('span', { className: `mt-0.5 text-sm ${ok ? 'text-green-400' : 'text-red-400'}` }, ok ? '●' : '○'),
+    h('div', { className: 'flex-1 min-w-0' },
+      h('div', { className: 'flex items-center gap-2' },
+        h('span', { className: 'font-medium text-sm truncate' }, o.alias || o.username),
+        o.isSandbox && h('span', { className: 'badge bg-yellow-900/50 text-yellow-400 border border-yellow-800' }, 'Sandbox'),
+        o.isScratch && h('span', { className: 'badge bg-purple-900/50 text-purple-400 border border-purple-800' }, 'Scratch'),
+        o.dataCloudEnabled && o.hasDataCloudConfig && h('span', { className: 'badge bg-teal-900/50 text-teal-400 border border-teal-800' }, 'Data 360 ✓'),
+        o.dataCloudEnabled && !o.hasDataCloudConfig && h('span', { className: 'badge bg-amber-900/50 text-amber-400 border border-amber-800' }, 'Data 360')
+      ),
+      h('p', { className: 'text-xs text-gray-400 truncate' }, o.username),
+      o.name && h('p', { className: 'text-xs text-gray-500 truncate' }, o.name)
+    ),
+    isSelected && h('span', { className: 'w-1.5 h-1.5 rounded-full bg-blue-500 mt-2 flex-shrink-0' })
+  )
+}
+
+// ─── SESSION LIST ───────────────────────────────────────────────────────────
+function SessionList({ sessions, selectedId, onSelect, loading, onRefresh }) {
+  return h('div', { className: 'flex flex-col h-full' },
+    h('div', { className: 'flex items-center justify-between px-4 py-3 border-b border-gray-800 flex-shrink-0' },
+      h('div', null,
+        h('h2', { className: 'text-sm font-semibold' }, 'Sessions'),
+        !loading && sessions && h('p', { className: 'text-xs text-gray-500 mt-0.5' }, `${sessions.length} records`)
+      ),
+      h('button', { onClick: onRefresh, disabled: loading, className: 'p-1.5 rounded-md hover:bg-gray-800 text-gray-400 transition-colors disabled:opacity-40', title: 'Refresh' },
+        loading ? '⟳' : '↻'
+      )
+    ),
+    h('div', { className: 'flex-1 overflow-y-auto' },
+      loading && h('div', { className: 'flex items-center justify-center h-40 text-gray-500' }, 'Loading…'),
+      !loading && sessions && sessions.length === 0 && h('div', { className: 'flex flex-col items-center justify-center h-40 text-gray-600' },
+        h('p', { className: 'text-2xl mb-2' }, '💬'),
+        h('p', { className: 'text-sm' }, 'No sessions found')
+      ),
+      !loading && sessions && sessions.map(s => SessionRow({ s, selected: s['ssot__Id__c'] === selectedId, onClick: () => onSelect(s) }))
+    )
+  )
+}
+
+function SessionRow({ s, selected, onClick }) {
+  return h('button', {
+    key: s['ssot__Id__c'],
+    onClick,
+    className: `w-full text-left px-4 py-3.5 border-b border-gray-800/60 hover:bg-gray-800/50 transition-colors border-l-2 ${selected ? 'bg-gray-800 border-l-blue-500' : 'border-l-transparent'}`
+  },
+    h('div', { className: 'flex items-start justify-between gap-3 mb-1.5' },
+      h('span', { className: 'font-mono text-xs text-gray-400 truncate flex-1' }, s['ssot__Id__c']),
+      h('span', { className: 'text-xs text-gray-500 flex-shrink-0' }, timeAgo(s['ssot__StartTimestamp__c']))
+    ),
+    h('div', { className: 'flex flex-wrap items-center gap-1.5' },
+      s['ssot__AiAgentChannelType__c'] && h('span', { className: 'badge bg-gray-800 text-gray-400' }, s['ssot__AiAgentChannelType__c'])
+    ),
+    s['ssot__AiAgentSessionEndType__c'] && h('p', { className: 'text-xs text-gray-500 mt-0.5' }, `Ended: ${s['ssot__AiAgentSessionEndType__c']}`)
+  )
+}
+
+// ─── SESSION DETAIL ─────────────────────────────────────────────────────────
+function SessionDetail({ session, orgAlias, orgObj }) {
+  const [data, setData] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState(null)
+  const [tab, setTab] = useState('timeline')
+
+  useEffect(() => {
+    if (!session || !orgAlias) return
+    setData(null); setError(null); setLoading(true)
+    fetchSessionFull(orgAlias, session['ssot__Id__c'])
+      .then(d => { setData(d); setLoading(false) })
+      .catch(e => { setError(e.message); setLoading(false) })
+  }, [session?.['ssot__Id__c'], orgAlias])
+
+  if (!session) return h('div', { className: 'flex flex-col items-center justify-center h-full text-gray-700' },
+    h('p', { className: 'text-4xl mb-3' }, '🤖'),
+    h('p', { className: 'text-sm' }, 'Select a session')
+  )
+
+  const start = session['ssot__StartTimestamp__c']
+  const end = session['ssot__EndTimestamp__c']
+  const elapsedS = start && end ? Math.round((new Date(end) - new Date(start)) / 1000) : null
+
+  const TABS = [
+    { id: 'timeline', label: `Timeline${data ? ` (${data.interactions?.length || 0})` : ''}` },
+    { id: 'participants', label: `Participants${data ? ` (${data.participants?.length || 0})` : ''}` },
+    { id: 'raw', label: 'Raw JSON' },
+  ]
+
+  return h('div', { className: 'flex flex-col h-full overflow-hidden' },
+    // Header
+    h('div', { className: 'px-5 py-4 border-b border-gray-800 flex-shrink-0' },
+      h('div', { className: 'flex items-start justify-between gap-4 mb-2' },
+        h('div', { className: 'min-w-0 flex-1' },
+          h('div', { className: 'flex items-center gap-2 mb-2' },
+            h('span', { className: 'font-mono text-xs text-gray-400 truncate' }, session['ssot__Id__c']),
+            orgObj && h('a', {
+              href: `${orgObj.instanceUrl}/${session['ssot__Id__c']}`, target: '_blank', rel: 'noreferrer',
+              className: 'text-gray-500 hover:text-blue-400 text-xs'
+            }, '↗')
+          ),
+          h('div', { className: 'flex flex-wrap gap-2 items-center' },
+            session['ssot__AiAgentChannelType__c'] && h('span', { className: 'badge bg-gray-800 text-gray-400' }, session['ssot__AiAgentChannelType__c'])
+          )
+        ),
+        h('div', { className: 'text-right text-xs text-gray-500 flex-shrink-0' },
+          start && h('p', null, fmtDate(start)),
+          end && h('p', { className: 'mt-0.5' }, `→ ${fmtTime(end)}`),
+          elapsedS !== null && h('p', { className: 'text-gray-600 mt-0.5' }, `${elapsedS}s total`)
+        )
+      ),
+      session['ssot__AiAgentSessionEndType__c'] && h('p', { className: 'text-xs text-gray-500' }, `ℹ Ended: ${session['ssot__AiAgentSessionEndType__c']}`)
+    ),
+    // Tabs
+    h('div', { className: 'flex border-b border-gray-800 flex-shrink-0' },
+      TABS.map(t => h('button', {
+        key: t.id, onClick: () => setTab(t.id),
+        className: `px-4 py-2.5 text-xs font-medium transition-colors ${tab === t.id ? 'text-blue-400 border-b-2 border-blue-500' : 'text-gray-400 hover:text-gray-200'}`
+      }, t.label))
+    ),
+    // Body
+    h('div', { className: 'flex-1 overflow-y-auto' },
+      loading && h('div', { className: 'flex items-center justify-center h-40 text-gray-500' }, 'Loading session data…'),
+      error && h('div', { className: 'mx-4 mt-4 p-3 bg-red-900/20 border border-red-800 rounded-lg text-red-400 text-sm' }, `⚠ ${error}`),
+      !loading && !error && data && tab === 'timeline' && h('div', { className: 'p-4 space-y-3' },
+        data.interactions.length === 0
+          ? h('p', { className: 'text-sm text-gray-500 text-center py-8' }, 'No interactions recorded')
+          : data.interactions.map(i => h(InteractionPanel, { key: i['ssot__Id__c'], interaction: i, allSteps: data.steps, allMessages: data.messages, orgAlias }))
+      ),
+      !loading && !error && data && tab === 'participants' && h('div', { className: 'p-4 space-y-2' },
+        data.participants.length === 0
+          ? h('p', { className: 'text-sm text-gray-500 text-center py-8' }, 'No participants recorded')
+          : data.participants.map(p => h('div', { key: p['ssot__Id__c'], className: 'card px-4 py-3 flex items-center gap-3' },
+              h('div', { className: 'w-8 h-8 rounded-full bg-gray-800 flex items-center justify-center text-sm' },
+                p['ssot__AiAgentType__c'] ? '🤖' : '👤'
+              ),
+              h('div', null,
+                h('p', { className: 'text-sm font-medium' }, p['ssot__AiAgentType__c'] || p['ssot__AiAgentSessionParticipantRole__c'] || 'Participant'),
+                h('p', { className: 'text-xs text-gray-500' }, [
+                  p['ssot__AiAgentSessionParticipantRole__c'],
+                  p['ssot__AiAgentApiName__c'],
+                  p['ssot__ParticipantId__c']
+                ].filter(Boolean).join(' · '))
+              ),
+              h('span', { className: 'ml-auto text-xs text-gray-600' }, fmtTime(p['ssot__StartTimestamp__c']))
+            ))
+      ),
+      !loading && !error && data && tab === 'raw' && h('div', { className: 'p-4' },
+        h('pre', { className: 'text-xs font-mono text-gray-300 bg-gray-950 rounded-lg p-4 overflow-auto' },
+          JSON.stringify({ session, ...data }, null, 2)
+        )
+      )
+    )
+  )
+}
+
+function InteractionPanel({ interaction, allSteps, allMessages, orgAlias }) {
+  const [open, setOpen] = useState(false)
+  const [tab, setTab] = useState('messages')
+  const [extraSteps, setExtraSteps] = useState(null)
+  const [extraMessages, setExtraMessages] = useState(null)
+
+  const iid = interaction['ssot__Id__c']
+  const mySteps = allSteps?.filter(s => s['ssot__AiAgentInteractionId__c'] === iid) ?? []
+  const myMessages = allMessages?.filter(m => m['ssot__AiAgentInteractionId__c'] === iid) ?? []
+
+  async function loadExtra() {
+    if (!open) {
+      setOpen(true)
+      if (mySteps.length === 0 && extraSteps === null) {
+        fetchSteps(orgAlias, iid).then(r => setExtraSteps(r.records || [])).catch(() => setExtraSteps([]))
+      }
+      if (myMessages.length === 0 && extraMessages === null) {
+        fetchMessages(orgAlias, iid).then(r => setExtraMessages(r.records || [])).catch(() => setExtraMessages([]))
+      }
+    } else {
+      setOpen(false)
+    }
+  }
+
+  const steps = extraSteps ?? mySteps
+  const messages = extraMessages ?? myMessages
+  const iStart = interaction['ssot__StartTimestamp__c']
+  const iEnd = interaction['ssot__EndTimestamp__c']
+  const iDurationMs = iStart && iEnd ? Math.round(new Date(iEnd) - new Date(iStart)) : null
+
+  return h('div', { className: 'card overflow-hidden' },
+    h('button', { onClick: loadExtra, className: 'w-full flex items-center gap-3 px-4 py-3 hover:bg-gray-800/40 text-left' },
+      h('span', { className: 'text-gray-400 text-xs' }, open ? '▼' : '▶'),
+      h('span', { className: 'text-orange-400' }, '⚡'),
+      h('span', { className: 'flex-1 text-sm font-medium text-gray-200 truncate' }, interaction['ssot__AiAgentInteractionType__c'] || interaction['ssot__TopicApiName__c'] || 'Interaction'),
+      h('div', { className: 'flex items-center gap-3' },
+        iDurationMs && h('span', { className: 'text-xs text-gray-500' }, duration(iDurationMs)),
+        h('span', { className: 'text-xs text-gray-500' }, fmtTime(iStart))
+      )
+    ),
+    open && h('div', { className: 'border-t border-gray-800' },
+      h('div', { className: 'flex border-b border-gray-800' },
+        ['messages', 'steps'].map(t => h('button', {
+          key: t, onClick: () => setTab(t),
+          className: `px-4 py-2 text-xs font-medium capitalize transition-colors ${tab === t ? 'text-blue-400 border-b-2 border-blue-500' : 'text-gray-400 hover:text-gray-200'}`
+        }, `${t} (${t === 'messages' ? messages.length : steps.length})`))
+      ),
+      tab === 'messages' && h('div', { className: 'p-4 space-y-3 max-h-96 overflow-y-auto' },
+        messages.length === 0 ? h('p', { className: 'text-xs text-gray-500 text-center' }, 'No messages') : null,
+        messages.map(m => h(MessageBubble, { key: m['ssot__Id__c'], msg: m }))
+      ),
+      tab === 'steps' && h('div', { className: 'p-4 space-y-2 max-h-96 overflow-y-auto' },
+        steps.length === 0 ? h('p', { className: 'text-xs text-gray-500 text-center' }, 'No steps') : null,
+        steps.map(s => h(StepRow, { key: s['ssot__Id__c'], step: s }))
+      )
+    )
+  )
+}
+
+function MessageBubble({ msg }) {
+  const msgType = msg['ssot__AiAgentInteractionMessageType__c'] || ''
+  const isUser = msgType === 'HumanMessage' || msgType.toLowerCase().includes('human') || msgType.toLowerCase().includes('user')
+  const ts = msg['ssot__MessageSentTimestamp__c'] || msg['MessageStartTimestamp__c']
+  const content = msg['ssot__ContentText__c']
+  return h('div', { className: `flex gap-3 ${isUser ? 'justify-end' : 'justify-start'}` },
+    !isUser && h('div', { className: 'w-7 h-7 rounded-full bg-blue-900/40 border border-blue-700/40 flex items-center justify-center flex-shrink-0 mt-0.5 text-sm' }, '🤖'),
+    h('div', { className: `max-w-3/4 rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${isUser ? 'bg-blue-600 text-white rounded-tr-sm' : 'bg-gray-800 text-gray-100 rounded-tl-sm'}` },
+      h('p', { className: 'whitespace-pre-wrap break-words' }, content || h('em', { className: 'opacity-50' }, '[empty]')),
+      h('div', { className: 'flex items-center gap-2 mt-1.5' },
+        msgType && h('span', { className: 'text-xs opacity-50' }, msgType),
+        ts && h('span', { className: 'text-xs opacity-50' }, fmtTime(ts))
+      )
+    ),
+    isUser && h('div', { className: 'w-7 h-7 rounded-full bg-gray-700 flex items-center justify-center flex-shrink-0 mt-0.5 text-sm' }, '👤')
+  )
+}
+
+function StepRow({ step }) {
+  const [open, setOpen] = useState(false)
+  const stepType = step['ssot__AiAgentInteractionStepType__c'] || ''
+  const TYPE_COLORS = {
+    LlmCall: 'bg-purple-900/50 text-purple-300 border-purple-800',
+    LLMCall: 'bg-purple-900/50 text-purple-300 border-purple-800',
+    Action: 'bg-blue-900/50 text-blue-300 border-blue-800',
+    FunctionCall: 'bg-blue-900/50 text-blue-300 border-blue-800',
+    Grounding: 'bg-yellow-900/50 text-yellow-300 border-yellow-800',
+    Guardrail: 'bg-red-900/50 text-red-300 border-red-800',
+    Planning: 'bg-green-900/50 text-green-300 border-green-800',
+  }
+  const cls = TYPE_COLORS[stepType] || 'bg-gray-800 text-gray-400'
+  const sStart = step['ssot__StartTimestamp__c']
+  const sEnd = step['ssot__EndTimestamp__c']
+  const sDurationMs = sStart && sEnd ? Math.round(new Date(sEnd) - new Date(sStart)) : null
+  const label = step['ssot__Name__c'] || step['SubType__c'] || stepType
+
+  return h('div', { className: 'border border-gray-800 rounded-lg overflow-hidden' },
+    h('button', { onClick: () => setOpen(v => !v), className: 'w-full flex items-center gap-3 px-3 py-2.5 hover:bg-gray-800/50 text-left' },
+      h('span', { className: 'text-gray-400 text-xs' }, open ? '▼' : '▶'),
+      h('span', { className: `badge border ${cls}` }, stepType || 'Step'),
+      h('span', { className: 'flex-1 text-sm truncate text-gray-300' }, label),
+      h('div', { className: 'flex items-center gap-2' },
+        sDurationMs && h('span', { className: 'text-xs text-gray-500' }, duration(sDurationMs))
+      )
+    ),
+    open && h('div', { className: 'border-t border-gray-800 bg-gray-950/50 px-4 py-3 space-y-2' },
+      step['ssot__ErrorMessageText__c'] && h('div', { className: 'text-red-400 text-xs bg-red-900/20 rounded-md p-2' }, `⚠ ${step['ssot__ErrorMessageText__c']}`),
+      h('div', { className: 'grid grid-cols-2 gap-2 text-xs text-gray-500' },
+        sStart && h('span', null, `Start: ${fmtTime(sStart)}`),
+        sEnd && h('span', null, `End: ${fmtTime(sEnd)}`),
+        step['SubType__c'] && h('span', null, `Subtype: ${step['SubType__c']}`),
+        step['ssot__GenAiGatewayRequestId__c'] && h('span', { className: 'col-span-2 truncate' }, `Request: ${step['ssot__GenAiGatewayRequestId__c']}`)
+      ),
+      step['ssot__InputValueText__c'] && h('div', null,
+        h('p', { className: 'text-xs text-gray-600 mb-1' }, 'Input'),
+        h('pre', { className: 'text-xs text-gray-400 bg-gray-900 rounded p-2 overflow-auto max-h-32' }, prettyJson(step['ssot__InputValueText__c']))
+      ),
+      step['ssot__OutputValueText__c'] && h('div', null,
+        h('p', { className: 'text-xs text-gray-600 mb-1' }, 'Output'),
+        h('pre', { className: 'text-xs text-gray-400 bg-gray-900 rounded p-2 overflow-auto max-h-32' }, prettyJson(step['ssot__OutputValueText__c']))
+      )
+    )
+  )
+}
+
+// ─── QUERY PANE ─────────────────────────────────────────────────────────────
+const EXAMPLES = [
+  { label: 'List tables', query: "SELECT datasetApiName, datasetName, datasetType\nFROM information_schema.tables\nWHERE datasetApiName LIKE '%AIAgent%'\nLIMIT 50" },
+  { label: 'Sessions', query: 'SELECT ssot__Id__c, ssot__StartTimestamp__c, ssot__EndTimestamp__c,\n       ssot__AiAgentChannelType__c, ssot__AiAgentSessionEndType__c, ssot__SessionOwnerId__c\nFROM ssot__AiAgentSession__dlm\nORDER BY ssot__StartTimestamp__c DESC\nLIMIT 50' },
+  { label: 'Interactions', query: 'SELECT ssot__Id__c, ssot__AiAgentSessionId__c, ssot__AiAgentInteractionType__c,\n       ssot__TopicApiName__c, ssot__StartTimestamp__c, ssot__EndTimestamp__c\nFROM ssot__AiAgentInteraction__dlm\nORDER BY ssot__StartTimestamp__c DESC\nLIMIT 50' },
+  { label: 'Steps', query: 'SELECT ssot__Id__c, ssot__AiAgentInteractionId__c, ssot__AiAgentInteractionStepType__c,\n       ssot__Name__c, SubType__c, ssot__StartTimestamp__c, ssot__EndTimestamp__c, ssot__ErrorMessageText__c\nFROM ssot__AiAgentInteractionStep__dlm\nORDER BY ssot__StartTimestamp__c DESC\nLIMIT 50' },
+  { label: 'Messages', query: 'SELECT ssot__Id__c, ssot__AiAgentInteractionId__c, ssot__AiAgentInteractionMessageType__c,\n       ssot__ContentText__c, ssot__MessageSentTimestamp__c\nFROM ssot__AiAgentInteractionMessage__dlm\nORDER BY ssot__MessageSentTimestamp__c DESC\nLIMIT 50' },
+  { label: 'Participants', query: 'SELECT ssot__Id__c, ssot__AiAgentSessionId__c, ssot__AiAgentType__c,\n       ssot__AiAgentApiName__c, ssot__AiAgentSessionParticipantRole__c, ssot__ParticipantId__c\nFROM ssot__AiAgentSessionParticipant__dlm\nORDER BY ssot__StartTimestamp__c DESC\nLIMIT 50' },
+  { label: 'Interactions by session', query: 'SELECT ssot__AiAgentSessionId__c, COUNT(*) AS InteractionCount\nFROM ssot__AiAgentInteraction__dlm\nGROUP BY ssot__AiAgentSessionId__c\nORDER BY InteractionCount DESC\nLIMIT 50' },
+]
+
+function QueryPane({ orgAlias }) {
+  const [query, setQuery] = useState(EXAMPLES[0].query)
+  const [loading, setLoading] = useState(false)
+  const [result, setResult] = useState(null)
+  const [error, setError] = useState(null)
+  const [showExamples, setShowExamples] = useState(false)
+
+  async function run() {
+    if (!query.trim() || !orgAlias) return
+    setLoading(true); setError(null); setResult(null)
+    try { setResult(await runQuery(orgAlias, query.trim())) }
+    catch (e) { setError(e.message) }
+    setLoading(false)
+  }
+
+  return h('div', { className: 'flex flex-col h-full' },
+    h('div', { className: 'px-4 py-3 border-b border-gray-800 flex items-center justify-between' },
+      h('h2', { className: 'text-sm font-semibold' }, 'Data 360 SQL Query'),
+      h('span', { className: 'text-xs text-gray-500 font-mono' }, '/api/v1/query')
+    ),
+    h('div', { className: 'flex-1 flex flex-col overflow-hidden p-4 gap-3' },
+      h('div', null,
+        h('button', { onClick: () => setShowExamples(v => !v), className: 'text-xs text-gray-400 hover:text-gray-200 mb-2' },
+          `${showExamples ? '▼' : '▶'} Example queries`
+        ),
+        showExamples && h('div', { className: 'flex flex-wrap gap-2 mb-2' },
+          EXAMPLES.map(e => h('button', {
+            key: e.label,
+            onClick: () => { setQuery(e.query); setShowExamples(false) },
+            className: 'text-xs px-2.5 py-1 rounded-md bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700'
+          }, e.label))
+        )
+      ),
+      h('div', { className: 'relative' },
+        h('textarea', {
+          value: query, onChange: e => setQuery(e.target.value),
+          onKeyDown: e => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') run() },
+          className: 'w-full h-36 bg-gray-950 border border-gray-700 rounded-lg px-3 py-2.5 text-xs font-mono text-gray-200 resize-none focus:outline-none focus:border-blue-500',
+          placeholder: 'SELECT Id FROM ssot__AiAgentSession__dlm LIMIT 10'
+        }),
+        h('button', {
+          onClick: run, disabled: loading || !orgAlias,
+          className: 'absolute bottom-2.5 right-2.5 flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs bg-blue-600 hover:bg-blue-700 text-white font-medium disabled:opacity-40 transition-colors'
+        }, loading ? 'Running…' : '▶ Run  ⌘↵')
+      ),
+      error && h('div', { className: 'p-3 bg-red-900/20 border border-red-800 rounded-lg text-red-400 text-xs' }, `⚠ ${error}`),
+      result && h('div', { className: 'flex-1 overflow-auto card' },
+        h('div', { className: 'flex items-center justify-between px-3 py-2 border-b border-gray-800' },
+          h('span', { className: 'text-xs text-gray-400' }, `${(result.totalSize ?? result.records?.length ?? 0).toLocaleString()} rows`)
+        ),
+        h(ResultTable, { records: result.records })
+      )
+    )
+  )
+}
+
+function ResultTable({ records }) {
+  if (!records || records.length === 0) return h('p', { className: 'text-xs text-gray-500 text-center py-4' }, 'No results')
+  const keys = Object.keys(records[0]).filter(k => k !== 'attributes')
+  return h('div', { className: 'overflow-auto' },
+    h('table', { className: 'w-full text-xs' },
+      h('thead', null,
+        h('tr', { className: 'border-b border-gray-800' },
+          keys.map(k => h('th', { key: k, className: 'text-left px-3 py-2 font-medium text-gray-400 whitespace-nowrap' }, k))
+        )
+      ),
+      h('tbody', null,
+        records.map((row, i) => h('tr', { key: i, className: 'border-b border-gray-800/50 hover:bg-gray-800/30' },
+          keys.map(k => h('td', {
+            key: k, className: 'px-3 py-2 text-gray-300 font-mono max-w-xs truncate',
+            title: String(row[k] ?? '')
+          }, row[k] === null || row[k] === undefined ? h('span', { className: 'text-gray-600' }, 'null') : String(row[k])))
+        ))
+      )
+    )
+  )
+}
+
+// ─── APP ────────────────────────────────────────────────────────────────────
+function App() {
+  const [orgs, setOrgs] = useState([])
+  const [selectedOrg, setSelectedOrg] = useState(null)
+  const [orgsLoading, setOrgsLoading] = useState(true)
+  const [tab, setTab] = useState('sessions')
+  const [sessions, setSessions] = useState(null)
+  const [sessionsLoading, setSessionsLoading] = useState(false)
+  const [sessionsError, setSessionsError] = useState(null)
+  const [noConfig, setNoConfig] = useState(false)
+  const [selectedSession, setSelectedSession] = useState(null)
+  const [showConfig, setShowConfig] = useState(false)
+
+  function loadOrgs() {
+    setOrgsLoading(true)
+    fetchOrgs()
+      .then(({ orgs }) => {
+        setOrgs(orgs)
+        const first = orgs.find(o => o.connectedStatus === 'Connected')
+        if (first) setSelectedOrg(first)
+        setOrgsLoading(false)
+      })
+      .catch(() => setOrgsLoading(false))
+  }
+
+  useEffect(() => { loadOrgs() }, [])
+
+  const orgAlias = selectedOrg ? (selectedOrg.alias || selectedOrg.username) : null
+
+  const loadSessions = useCallback(async () => {
+    if (!orgAlias) return
+    setSessionsLoading(true); setSessionsError(null); setSelectedSession(null); setNoConfig(false)
+    try {
+      const d = await fetchSessions(orgAlias)
+      setSessions(d.records || [])
+    } catch (e) {
+      if (e.code === 'NO_CONFIG') { setNoConfig(true); setSessions([]) }
+      else { setSessionsError(e.message); setSessions([]) }
+    }
+    setSessionsLoading(false)
+  }, [orgAlias])
+
+  useEffect(() => {
+    if (orgAlias && tab === 'sessions') loadSessions()
+  }, [orgAlias, tab])
+
+  const TABS = [
+    { id: 'sessions', label: '📋 Sessions' },
+    { id: 'query', label: '🔍 Query' },
+  ]
+
+  return h('div', { className: 'flex flex-col h-screen overflow-hidden' },
+    // Credentials modal
+    showConfig && h(CredentialsModal, {
+      org: selectedOrg,
+      onClose: () => setShowConfig(false),
+      onSaved: () => { loadOrgs(); loadSessions() }
+    }),
+
+    // Header
+    h('header', { className: 'flex items-center gap-4 px-4 py-2.5 border-b border-gray-800 bg-gray-900 flex-shrink-0' },
+      h('div', { className: 'flex items-center gap-2.5' },
+        h('div', { className: 'w-7 h-7 rounded-lg bg-blue-900/40 border border-blue-700/40 flex items-center justify-center text-sm' }, '🤖'),
+        h('span', { className: 'font-semibold text-sm' }, 'Agentforce Session Viewer')
+      ),
+      h('div', { className: 'flex items-center gap-1 ml-4' },
+        TABS.map(t => h('button', {
+          key: t.id, onClick: () => setTab(t.id),
+          className: `flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm transition-colors ${tab === t.id ? 'bg-gray-800 text-white' : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800/50'}`
+        }, t.label))
+      ),
+      h('div', { className: 'ml-auto flex items-center gap-2' },
+        selectedOrg && selectedOrg.dataCloudEnabled && h('button', {
+          onClick: () => setShowConfig(true),
+          title: 'Configure Data 360 credentials',
+          className: `px-2.5 py-1.5 rounded-md text-sm transition-colors border ${selectedOrg.hasDataCloudConfig ? 'text-teal-400 border-teal-800 bg-teal-900/20 hover:bg-teal-900/40' : 'text-amber-400 border-amber-800 bg-amber-900/20 hover:bg-amber-900/40'}`
+        }, selectedOrg.hasDataCloudConfig ? '⚙ Data 360 ✓' : '⚙ Setup Data 360'),
+        h(OrgSelector, { orgs, selected: selectedOrg, onSelect: o => { setSelectedOrg(o); setSessions(null); setNoConfig(false) }, loading: orgsLoading })
+      )
+    ),
+
+    // Main
+    !selectedOrg && !orgsLoading
+      ? h('div', { className: 'flex-1 flex items-center justify-center text-gray-600' },
+          h('div', { className: 'text-center' },
+            h('p', { className: 'text-5xl mb-3' }, '🤖'),
+            h('p', { className: 'text-sm' }, 'Select an org to get started')
+          )
+        )
+      : tab === 'sessions'
+        ? h('div', { className: 'flex-1 flex overflow-hidden' },
+            h('div', { className: 'w-72 border-r border-gray-800 flex-shrink-0 flex flex-col overflow-hidden' },
+              noConfig
+                ? h('div', { className: 'flex flex-col items-center justify-center h-full text-center p-6' },
+                    h('p', { className: 'text-3xl mb-3' }, '🔑'),
+                    h('p', { className: 'text-sm font-medium mb-1' }, 'Data 360 not configured'),
+                    h('p', { className: 'text-xs text-gray-500 mb-4' }, 'Set up a Connected App with cdp_query_api scope to query Data 360 session data.'),
+                    h('button', { onClick: () => setShowConfig(true), className: 'px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-sm font-medium' }, 'Configure now')
+                  )
+                : h(SessionList, { sessions, selectedId: selectedSession?.['ssot__Id__c'], onSelect: setSelectedSession, loading: sessionsLoading, onRefresh: loadSessions }),
+              sessionsError && h('div', { className: 'm-3 p-2.5 bg-red-900/20 border border-red-800 rounded-lg text-red-400 text-xs' }, `⚠ ${sessionsError}`)
+            ),
+            h('div', { className: 'flex-1 overflow-hidden' },
+              h(SessionDetail, { session: selectedSession, orgAlias, orgObj: selectedOrg })
+            )
+          )
+        : h('div', { className: 'flex-1 overflow-hidden' },
+            noConfig
+              ? h('div', { className: 'flex flex-col items-center justify-center h-full text-center p-6' },
+                  h('p', { className: 'text-3xl mb-3' }, '🔑'),
+                  h('p', { className: 'text-sm font-medium mb-1' }, 'Data 360 not configured'),
+                  h('button', { onClick: () => setShowConfig(true), className: 'mt-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-sm font-medium' }, 'Configure now')
+                )
+              : h(QueryPane, { orgAlias })
+          )
+  )
+}
+
+createRoot(document.getElementById('root')).render(h(App))
+</script>
+</body>
+</html>
