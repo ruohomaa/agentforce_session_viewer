@@ -75,6 +75,13 @@ const deleteOrgConfig = (org) => api(`/orgs/${encodeURIComponent(org)}/config`, 
 const testOrgConfig = (org) => api(`/orgs/${encodeURIComponent(org)}/config/test`, { method: 'POST' })
 const fetchSessionUsage = (org, id) => api(`/orgs/${encodeURIComponent(org)}/sessions/${id}/usage`)
 const fetchUsage = (org, period) => api(`/orgs/${encodeURIComponent(org)}/usage?period=${period}`)
+const fetchGenAiRequest = (org, requestId, generationId, interactionId) => {
+  const params = new URLSearchParams()
+  if (generationId) params.set('generationId', generationId)
+  if (interactionId) params.set('interactionId', interactionId)
+  const qs = params.toString() ? `?${params}` : ''
+  return api(`/orgs/${encodeURIComponent(org)}/genai-request/${encodeURIComponent(requestId)}${qs}`)
+}
 
 // ─── UTILS ─────────────────────────────────────────────────────────────────
 function timeAgo(dateStr) {
@@ -599,7 +606,7 @@ function InteractionPanel({ interaction, allSteps, allMessages, orgAlias }) {
       ),
       tab === 'steps' && h('div', { className: 'p-4 space-y-2 max-h-96 overflow-y-auto' },
         steps.length === 0 ? h('p', { className: 'text-xs text-gray-500 text-center' }, 'No steps') : null,
-        steps.map(s => h(StepRow, { key: s['ssot__Id__c'], step: s }))
+        steps.map(s => h(StepRow, { key: s['ssot__Id__c'], step: s, orgAlias, interactionId: iid }))
       )
     )
   )
@@ -623,8 +630,12 @@ function MessageBubble({ msg }) {
   )
 }
 
-function StepRow({ step }) {
+function StepRow({ step, orgAlias, interactionId }) {
   const [open, setOpen] = useState(false)
+  const [genAi, setGenAi] = useState(null)   // { request, generation } | 'loading' | 'error'
+  const [showFullPrompt, setShowFullPrompt] = useState(false)
+  const [showFullResponse, setShowFullResponse] = useState(false)
+
   const stepType = step['ssot__AiAgentInteractionStepType__c'] || ''
   const TYPE_COLORS = {
     LlmCall: 'bg-purple-900/50 text-purple-300 border-purple-800',
@@ -640,31 +651,119 @@ function StepRow({ step }) {
   const sEnd = step['ssot__EndTimestamp__c']
   const sDurationMs = sStart && sEnd ? Math.round(new Date(sEnd) - new Date(sStart)) : null
   const label = step['ssot__Name__c'] || step['SubType__c'] || stepType
+  const requestId = step['ssot__GenAiGatewayRequestId__c'] === 'NOT_SET' ? null : step['ssot__GenAiGatewayRequestId__c']
+  const generationId = step['ssot__GenerationId__c'] === 'NOT_SET' ? null : step['ssot__GenerationId__c']
+
+  function toggle() {
+    const nowOpen = !open
+    setOpen(nowOpen)
+    if (nowOpen && requestId && genAi === null) {
+      setGenAi('loading')
+      fetchGenAiRequest(orgAlias, requestId, generationId, interactionId)
+        .then(d => setGenAi(d))
+        .catch(e => setGenAi({ error: e.message }))
+    }
+  }
+
+  function PromptBlock({ text, label }) {
+    if (!text) return null
+    const lines = text.split('\n').length
+    const truncate = !showFullPrompt && lines > 20
+    const displayed = truncate ? text.split('\n').slice(0, 20).join('\n') + '\n…' : text
+    return h('div', null,
+      h('div', { className: 'flex items-center justify-between mb-1' },
+        h('p', { className: 'text-xs font-medium text-gray-500' }, label),
+        lines > 20 && h('button', {
+          onClick: () => setShowFullPrompt(v => !v),
+          className: 'text-[10px] text-blue-500 hover:text-blue-400'
+        }, showFullPrompt ? 'collapse' : `show all ${lines} lines`)
+      ),
+      h('pre', { className: 'text-xs text-gray-300 bg-gray-900 border border-gray-800 rounded p-3 overflow-auto', style: { maxHeight: truncate ? '160px' : '500px' } }, displayed)
+    )
+  }
+
+  function ResponseBlock({ text, label }) {
+    if (!text) return null
+    const truncate = !showFullResponse && text.length > 1000
+    const displayed = truncate ? text.slice(0, 1000) + '…' : text
+    return h('div', null,
+      h('div', { className: 'flex items-center justify-between mb-1' },
+        h('p', { className: 'text-xs font-medium text-gray-500' }, label),
+        text.length > 1000 && h('button', {
+          onClick: () => setShowFullResponse(v => !v),
+          className: 'text-[10px] text-blue-500 hover:text-blue-400'
+        }, showFullResponse ? 'collapse' : `show all ${text.length} chars`)
+      ),
+      h('pre', { className: 'text-xs text-gray-300 bg-gray-900 border border-gray-800 rounded p-3 overflow-auto whitespace-pre-wrap', style: { maxHeight: showFullResponse ? '500px' : '200px' } }, displayed)
+    )
+  }
 
   return h('div', { className: 'border border-gray-800 rounded-lg overflow-hidden' },
-    h('button', { onClick: () => setOpen(v => !v), className: 'w-full flex items-center gap-3 px-3 py-2.5 hover:bg-gray-800/50 text-left' },
+    h('button', { onClick: toggle, className: 'w-full flex items-center gap-3 px-3 py-2.5 hover:bg-gray-800/50 text-left' },
       h('span', { className: 'text-gray-400 text-xs' }, open ? '▼' : '▶'),
       h('span', { className: `badge border ${cls}` }, stepType || 'Step'),
       h('span', { className: 'flex-1 text-sm truncate text-gray-300' }, label),
       h('div', { className: 'flex items-center gap-2' },
-        sDurationMs && h('span', { className: 'text-xs text-gray-500' }, duration(sDurationMs))
+        sDurationMs && h('span', { className: 'text-xs text-gray-500' }, duration(sDurationMs)),
+        requestId && h('span', { className: 'text-[10px] text-purple-500' }, '🔗 LLM')
       )
     ),
-    open && h('div', { className: 'border-t border-gray-800 bg-gray-950/50 px-4 py-3 space-y-2' },
-      step['ssot__ErrorMessageText__c'] && h('div', { className: 'text-red-400 text-xs bg-red-900/20 rounded-md p-2' }, `⚠ ${step['ssot__ErrorMessageText__c']}`),
+    open && h('div', { className: 'border-t border-gray-800 bg-gray-950/50 px-4 py-3 space-y-3' },
+
+      // Basic step metadata
       h('div', { className: 'grid grid-cols-2 gap-2 text-xs text-gray-500' },
         sStart && h('span', null, `Start: ${fmtTime(sStart)}`),
         sEnd && h('span', null, `End: ${fmtTime(sEnd)}`),
-        step['SubType__c'] && h('span', null, `Subtype: ${step['SubType__c']}`),
-        step['ssot__GenAiGatewayRequestId__c'] && h('span', { className: 'col-span-2 truncate' }, `Request: ${step['ssot__GenAiGatewayRequestId__c']}`)
+        step['SubType__c'] && h('span', null, `Subtype: ${step['SubType__c']}`)
       ),
+
+      step['ssot__ErrorMessageText__c'] && h('div', { className: 'text-red-400 text-xs bg-red-900/20 rounded-md p-2' }, `⚠ ${step['ssot__ErrorMessageText__c']}`),
+
+      // Step input/output (action steps)
       step['ssot__InputValueText__c'] && h('div', null,
-        h('p', { className: 'text-xs text-gray-600 mb-1' }, 'Input'),
+        h('p', { className: 'text-xs font-medium text-gray-500 mb-1' }, 'Step input'),
         h('pre', { className: 'text-xs text-gray-400 bg-gray-900 rounded p-2 overflow-auto max-h-32' }, prettyJson(step['ssot__InputValueText__c']))
       ),
       step['ssot__OutputValueText__c'] && h('div', null,
-        h('p', { className: 'text-xs text-gray-600 mb-1' }, 'Output'),
+        h('p', { className: 'text-xs font-medium text-gray-500 mb-1' }, 'Step output'),
         h('pre', { className: 'text-xs text-gray-400 bg-gray-900 rounded p-2 overflow-auto max-h-32' }, prettyJson(step['ssot__OutputValueText__c']))
+      ),
+
+      // GenAI Gateway details
+      requestId && h('div', { className: 'border-t border-gray-800 pt-3 space-y-3' },
+        genAi === 'loading' && h('p', { className: 'text-xs text-gray-500' }, 'Loading LLM details…'),
+        genAi?.error && h('p', { className: 'text-xs text-red-400' }, `⚠ ${genAi.error}`),
+        genAi?.request && h(React.Fragment, null,
+          // Model + billing metadata row
+          h('div', { className: 'flex flex-wrap gap-2 text-xs items-center' },
+            h('span', { className: 'bg-purple-900/30 text-purple-300 border border-purple-800 badge' }, genAi.request.model__c || genAi.request.provider__c || 'LLM'),
+            genAi.request.promptTokens__c > 0 && h('span', { className: 'text-gray-500' }, `↑ ${genAi.request.promptTokens__c?.toLocaleString()} in`),
+            genAi.request.completionTokens__c > 0 && h('span', { className: 'text-gray-500' }, `↓ ${genAi.request.completionTokens__c?.toLocaleString()} out`),
+            genAi.request.temperature__c != null && h('span', { className: 'text-gray-600' }, `temp ${genAi.request.temperature__c}`),
+            genAi.request.promptTemplateDevName__c && h('span', { className: 'text-gray-600 truncate max-w-xs' }, `template: ${genAi.request.promptTemplateDevName__c}`),
+            genAi.request.enablePiiMasking__c === 'true' && h('span', { className: 'text-amber-700 text-[10px]' }, 'PII masked'),
+            // Billing indicator
+            genAi.billing
+              ? h('div', { className: 'ml-auto flex items-center gap-1.5 flex-shrink-0' },
+                  genAi.billing.IsBillableIndicator__c
+                    ? h('span', { className: 'badge bg-teal-900/40 text-teal-400 border border-teal-800' }, '💰 Billable')
+                    : h('span', { className: 'badge bg-gray-800 text-gray-500 border border-gray-700' }, '— Not billed'),
+                  genAi.billing.MeteringSkipReasonCode__c && h('span', { className: 'text-[10px] text-gray-600' }, genAi.billing.MeteringSkipReasonCode__c.replace(/_/g, ' ').toLowerCase()),
+                  genAi.billing.UnitTypeCode__c && h('span', { className: 'text-[10px] text-gray-700' }, `· ${genAi.billing.UsageQuantity__c ?? ''} ${genAi.billing.UnitTypeCode__c}`)
+                )
+              : null
+          ),
+          // Prompt
+          h(PromptBlock, {
+            text: genAi.request.prompt__c || genAi.request.maskedPrompt__c,
+            label: genAi.request.prompt__c ? 'Prompt' : 'Prompt (masked)'
+          })
+        ),
+        // Generation / response
+        genAi?.generation && h(ResponseBlock, {
+          text: genAi.generation.responseText__c || genAi.generation.maskedResponseText__c,
+          label: genAi.generation.responseText__c ? 'LLM response' : 'LLM response (masked)'
+        })
       )
     )
   )

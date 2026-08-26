@@ -358,6 +358,47 @@ app.get('/api/orgs/:org/usage', async (req, res) => {
   } catch (err) { handleDcError(err, res) }
 })
 
+app.get('/api/orgs/:org/genai-request/:requestId', async (req, res) => {
+  const { org, requestId } = req.params
+  const { generationId } = req.query
+  try {
+    const [reqResult, genResult, usageResult] = await Promise.all([
+      dcQueryAll(org,
+        `SELECT gatewayRequestId__c, prompt__c, maskedPrompt__c, model__c, provider__c,
+                feature__c, appType__c, timestamp__c,
+                promptTokens__c, completionTokens__c, totalTokens__c,
+                temperature__c, frequencyPenalty__c, presencePenalty__c,
+                numGenerations__c, promptTemplateDevName__c, parameters__c,
+                enableInputSafetyScoring__c, enableOutputSafetyScoring__c, enablePiiMasking__c
+         FROM GenAIGatewayRequest__dlm
+         WHERE gatewayRequestId__c = '${requestId}' LIMIT 1`
+      ),
+      generationId
+        ? dcQueryAll(org,
+            `SELECT generationId__c, responseText__c, maskedResponseText__c, responseParameters__c
+             FROM GenAIGeneration__dlm
+             WHERE generationId__c = '${generationId}' LIMIT 1`
+          ).catch(() => ({ records: [] }))
+        : Promise.resolve({ records: [] }),
+      req.query.interactionId
+        ? dcQueryAll(org,
+            `SELECT IsBillableIndicator__c, IsMeteredIndicator__c, MeteringSkipReasonCode__c,
+                    TierQualifierType__c, UnitTypeCode__c, UsageTypeCode__c, UsageQuantity__c,
+                    PromptTotalTokenCount__c, PromptInputTokenCount__c, PromptCompletionTokenCount__c,
+                    ModelProviderName__c, ModelProviderModelName__c, GenAiGatewayFeatureName__c
+             FROM AiAgentGenerativeAiUsage_std__dlm
+             WHERE AiAgentInteractionId__c = '${req.query.interactionId}' LIMIT 1`
+          ).catch(() => ({ records: [] }))
+        : Promise.resolve({ records: [] }),
+    ])
+    res.json({
+      request: reqResult.records[0] ?? null,
+      generation: genResult.records[0] ?? null,
+      billing: usageResult.records[0] ?? null,
+    })
+  } catch (err) { handleDcError(err, res) }
+})
+
 app.post('/api/orgs/:org/query', async (req, res) => {
   const { query } = req.body
   if (!query) return res.status(400).json({ error: 'query is required' })
