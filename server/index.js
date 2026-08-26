@@ -358,6 +358,23 @@ app.get('/api/orgs/:org/usage', async (req, res) => {
   } catch (err) { handleDcError(err, res) }
 })
 
+app.get('/api/orgs/:org/action-stats', async (req, res) => {
+  const { org } = req.params
+  const { period = '7d' } = req.query
+  const periodMs = { '24h': 86400_000, '7d': 7 * 86400_000, '30d': 30 * 86400_000 }[period] ?? 7 * 86400_000
+  const since = new Date(Date.now() - periodMs).toISOString().replace('T', ' ').replace('Z', '')
+  try {
+    const result = await dcQueryAll(org,
+      `SELECT ssot__Id__c, ssot__StartTimestamp__c, SubType__c
+       FROM ssot__AiAgentInteractionStep__dlm
+       WHERE ssot__AiAgentInteractionStepType__c = 'ACTION_STEP'
+         AND ssot__StartTimestamp__c >= TIMESTAMP '${since}'
+       ORDER BY ssot__StartTimestamp__c ASC`
+    )
+    res.json(result)
+  } catch (err) { handleDcError(err, res) }
+})
+
 app.get('/api/orgs/:org/genai-request/:requestId', async (req, res) => {
   const { org, requestId } = req.params
   const { generationId } = req.query
