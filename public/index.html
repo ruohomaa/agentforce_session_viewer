@@ -84,26 +84,6 @@ const fetchGenAiRequest = (org, requestId, generationId, interactionId) => {
   return api(`/orgs/${encodeURIComponent(org)}/genai-request/${encodeURIComponent(requestId)}${qs}`)
 }
 
-// ─── CURRENCY & PRICING ────────────────────────────────────────────────────
-const CURRENCIES = {
-  USD: { symbol: '$',   rate: 1,     decimals: 2, label: 'USD – US Dollar' },
-  EUR: { symbol: '€',   rate: 0.92,  decimals: 2, label: 'EUR – Euro' },
-  GBP: { symbol: '£',   rate: 0.79,  decimals: 2, label: 'GBP – British Pound' },
-  SEK: { symbol: 'kr',  rate: 10.5,  decimals: 0, label: 'SEK – Swedish Krona' },
-  NOK: { symbol: 'kr',  rate: 10.7,  decimals: 0, label: 'NOK – Norwegian Krone' },
-  DKK: { symbol: 'kr',  rate: 6.9,   decimals: 2, label: 'DKK – Danish Krone' },
-  AUD: { symbol: 'A$',  rate: 1.55,  decimals: 2, label: 'AUD – Australian Dollar' },
-  CAD: { symbol: 'C$',  rate: 1.38,  decimals: 2, label: 'CAD – Canadian Dollar' },
-  JPY: { symbol: '¥',   rate: 149,   decimals: 0, label: 'JPY – Japanese Yen' },
-}
-const ACTION_PRICE_USD = 0.10
-
-function formatCost(usdAmount, currencyCode) {
-  const c = CURRENCIES[currencyCode] || CURRENCIES.USD
-  const amount = usdAmount * c.rate
-  return `${c.symbol}${amount.toFixed(c.decimals)}`
-}
-
 // ─── UTILS ─────────────────────────────────────────────────────────────────
 function timeAgo(dateStr) {
   if (!dateStr) return '—'
@@ -476,7 +456,7 @@ function SessionRow({ s, selected, onClick }) {
 }
 
 // ─── SESSION DETAIL ─────────────────────────────────────────────────────────
-function SessionDetail({ session, orgAlias, orgObj, currency }) {
+function SessionDetail({ session, orgAlias, orgObj }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
@@ -501,7 +481,6 @@ function SessionDetail({ session, orgAlias, orgObj, currency }) {
 
   const actionSteps = data ? data.steps.filter(s => s['ssot__AiAgentInteractionStepType__c'] === 'ACTION_STEP') : []
   const actionCount = actionSteps.length
-  const actionCostUsd = actionCount * ACTION_PRICE_USD
 
   const TABS = [
     { id: 'timeline', label: `Timeline${data ? ` (${data.interactions?.length || 0})` : ''}` },
@@ -525,9 +504,8 @@ function SessionDetail({ session, orgAlias, orgObj, currency }) {
           h('div', { className: 'flex flex-wrap gap-2 items-center' },
             session['ssot__AiAgentChannelType__c'] && h('span', { className: 'badge bg-gray-800 text-gray-400' }, session['ssot__AiAgentChannelType__c']),
             actionCount > 0 && h('span', {
-              className: 'badge bg-amber-900/30 text-amber-400 border border-amber-800/50',
-              title: `${actionCount} custom action${actionCount !== 1 ? 's' : ''} × ${formatCost(ACTION_PRICE_USD, currency)} = ${formatCost(actionCostUsd, currency)}`
-            }, `${actionCount} action${actionCount !== 1 ? 's' : ''} · ${formatCost(actionCostUsd, currency)}`)
+              className: 'badge bg-amber-900/30 text-amber-400 border border-amber-800/50'
+            }, `${actionCount} action${actionCount !== 1 ? 's' : ''}`)
           )
         ),
         h('div', { className: 'text-right text-xs text-gray-500 flex-shrink-0' },
@@ -572,7 +550,7 @@ function SessionDetail({ session, orgAlias, orgObj, currency }) {
               h('span', { className: 'ml-auto text-xs text-gray-600' }, fmtTime(p['ssot__StartTimestamp__c']))
             ))
       ),
-      tab === 'usage' && h(SessionUsageTab, { sessionId: session['ssot__Id__c'], orgAlias, actionCount, currency }),
+      tab === 'usage' && h(SessionUsageTab, { sessionId: session['ssot__Id__c'], orgAlias, actionCount }),
       !loading && !error && data && tab === 'raw' && h('div', { className: 'p-4' },
         h('pre', { className: 'text-xs font-mono text-gray-300 bg-gray-950 rounded-lg p-4 overflow-auto' },
           JSON.stringify({ session, ...data }, null, 2)
@@ -860,7 +838,7 @@ function ModelBar({ model, data, maxTokens }) {
 
 // ─── SESSION USAGE TAB ───────────────────────────────────────────────────────
 
-function SessionUsageTab({ sessionId, orgAlias, actionCount = 0, currency = 'USD' }) {
+function SessionUsageTab({ sessionId, orgAlias, actionCount = 0 }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
@@ -881,15 +859,12 @@ function SessionUsageTab({ sessionId, orgAlias, actionCount = 0, currency = 'USD
   const stats = usageStats(data)
   const models = Object.entries(stats.byModel).sort((a, b) => b[1].totalTokens - a[1].totalTokens)
   const maxModelTokens = models[0]?.[1].totalTokens ?? 1
-  const actionCostUsd = actionCount * ACTION_PRICE_USD
-
   return h('div', { className: 'p-4 space-y-5' },
     // Summary cards
-    h('div', { className: 'grid grid-cols-2 gap-2 sm:grid-cols-4' },
+    h('div', { className: 'grid grid-cols-2 gap-2 sm:grid-cols-3' },
       h(StatCard, { label: 'Total tokens', value: stats.totalTokens, sub: `↑ ${stats.inputTokens.toLocaleString()} in · ↓ ${stats.completionTokens.toLocaleString()} out`, accent: 'purple' }),
       h(StatCard, { label: 'LLM calls', value: stats.calls, accent: 'blue' }),
-      h(StatCard, { label: 'Custom actions', value: actionCount, sub: `${formatCost(ACTION_PRICE_USD, currency)} per action`, accent: 'green' }),
-      h(StatCard, { label: 'Est. action cost', value: formatCost(actionCostUsd, currency), sub: 'excl. flex credits', accent: actionCount > 0 ? 'green' : undefined })
+      h(StatCard, { label: 'Custom actions', value: actionCount, accent: 'green' })
     ),
 
     // By model
@@ -933,7 +908,7 @@ function SessionUsageTab({ sessionId, orgAlias, actionCount = 0, currency = 'USD
 
 // ─── ANALYTICS PANE ─────────────────────────────────────────────────────────
 
-function AnalyticsPane({ orgAlias, currency = 'USD' }) {
+function AnalyticsPane({ orgAlias }) {
   const [period, setPeriod] = useState('7d')
   const [data, setData] = useState(null)
   const [actions, setActions] = useState(null)
@@ -959,8 +934,6 @@ function AnalyticsPane({ orgAlias, currency = 'USD' }) {
 
   const stats = data ? usageStats(data) : null
   const totalActions = actions ? actions.length : 0
-  const totalActionCostUsd = totalActions * ACTION_PRICE_USD
-
   // Group by day for timeline
   const byDay = {}
   if (data) {
@@ -994,7 +967,7 @@ function AnalyticsPane({ orgAlias, currency = 'USD' }) {
   return h('div', { className: 'flex flex-col h-full overflow-hidden' },
     // Header
     h('div', { className: 'px-5 py-3 border-b border-gray-800 flex-shrink-0 flex items-center gap-3' },
-      h('h2', { className: 'text-sm font-semibold' }, 'Usage & Cost'),
+      h('h2', { className: 'text-sm font-semibold' }, 'Usage'),
       h('div', { className: 'flex gap-1 ml-4' },
         PERIODS.map(p => h('button', {
           key: p.id, onClick: () => setPeriod(p.id),
@@ -1009,14 +982,13 @@ function AnalyticsPane({ orgAlias, currency = 'USD' }) {
 
       !loading && !error && stats && h(React.Fragment, null,
         // Summary cards
-        h('div', { className: 'grid grid-cols-2 gap-3 lg:grid-cols-4 xl:grid-cols-7' },
+        h('div', { className: 'grid grid-cols-2 gap-3 lg:grid-cols-3 xl:grid-cols-6' },
           h(StatCard, { label: 'Sessions', value: sessionSet.size, accent: 'blue' }),
           h(StatCard, { label: 'LLM calls', value: stats.calls, accent: 'blue' }),
           h(StatCard, { label: 'Total tokens', value: stats.totalTokens, sub: `↑ ${stats.inputTokens.toLocaleString()} · ↓ ${stats.completionTokens.toLocaleString()}`, accent: 'purple' }),
           h(StatCard, { label: 'Billable calls', value: stats.billable, sub: stats.calls > 0 ? `${Math.round(stats.billable / stats.calls * 100)}%` : null, accent: 'green' }),
           h(StatCard, { label: 'Non-metered', value: stats.calls - stats.metered, sub: stats.metered > 0 ? `${stats.metered} metered` : null }),
-          h(StatCard, { label: 'Custom actions', value: totalActions, sub: `${formatCost(ACTION_PRICE_USD, currency)} / action`, accent: 'green' }),
-          h(StatCard, { label: 'Est. action cost', value: formatCost(totalActionCostUsd, currency), sub: 'custom actions only', accent: totalActions > 0 ? 'green' : undefined }),
+          h(StatCard, { label: 'Custom actions', value: totalActions, accent: 'green' }),
         ),
 
         // Token timeline
@@ -1167,10 +1139,6 @@ function App() {
   const [noConfig, setNoConfig] = useState(false)
   const [selectedSession, setSelectedSession] = useState(null)
   const [showConfig, setShowConfig] = useState(false)
-  const [currency, setCurrency] = useState(() => localStorage.getItem('currency') || 'USD')
-
-  function changeCurrency(c) { setCurrency(c); localStorage.setItem('currency', c) }
-
   function loadOrgs() {
     setOrgsLoading(true)
     fetchOrgs()
@@ -1236,14 +1204,6 @@ function App() {
           title: 'Configure Data 360 credentials',
           className: `px-2.5 py-1.5 rounded-md text-sm transition-colors border ${selectedOrg.hasDataCloudConfig ? 'text-teal-400 border-teal-800 bg-teal-900/20 hover:bg-teal-900/40' : 'text-amber-400 border-amber-800 bg-amber-900/20 hover:bg-amber-900/40'}`
         }, selectedOrg.hasDataCloudConfig ? '⚙ Data 360 ✓' : '⚙ Setup Data 360'),
-        h('select', {
-          value: currency,
-          onChange: e => changeCurrency(e.target.value),
-          title: 'Display currency (rates approximate)',
-          className: 'bg-gray-800 border border-gray-700 rounded-md text-xs text-gray-300 px-2 py-1.5 focus:outline-none focus:border-gray-500'
-        }, Object.entries(CURRENCIES).map(([code, c]) =>
-          h('option', { key: code, value: code }, code)
-        )),
         h(OrgSelector, { orgs, selected: selectedOrg, onSelect: o => { setSelectedOrg(o); setSessions(null); setNoConfig(false) }, loading: orgsLoading })
       )
     ),
@@ -1270,7 +1230,7 @@ function App() {
               sessionsError && h('div', { className: 'm-3 p-2.5 bg-red-900/20 border border-red-800 rounded-lg text-red-400 text-xs' }, `⚠ ${sessionsError}`)
             ),
             h('div', { className: 'flex-1 overflow-hidden' },
-              h(SessionDetail, { session: selectedSession, orgAlias, orgObj: selectedOrg, currency })
+              h(SessionDetail, { session: selectedSession, orgAlias, orgObj: selectedOrg })
             )
           )
         : tab === 'analytics'
@@ -1281,7 +1241,7 @@ function App() {
                     h('p', { className: 'text-sm font-medium mb-1' }, 'Data 360 not configured'),
                     h('button', { onClick: () => setShowConfig(true), className: 'mt-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-sm font-medium' }, 'Configure now')
                   )
-                : h(AnalyticsPane, { orgAlias, currency })
+                : h(AnalyticsPane, { orgAlias })
             )
           : h('div', { className: 'flex-1 overflow-hidden' },
               noConfig
