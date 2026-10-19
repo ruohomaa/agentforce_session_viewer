@@ -96,6 +96,14 @@ function handleDcError(err, res) {
   if (err.message === 'NO_CONFIG') {
     return res.status(400).json({ error: 'NO_CONFIG', message: 'Data Cloud credentials not configured for this org.' })
   }
+  if (err.message.startsWith('Data Cloud API 404: ') &&
+      err.message.includes('DataModelEntity with developerName = AiAgentGenerativeAiUsage_std__dlm ') &&
+      err.message.includes('is not found')) {
+    return res.status(503).json({
+      error: 'USAGE_ANALYTICS_UNAVAILABLE',
+      message: 'Usage analytics is unavailable in this org: the AiAgentGenerativeAiUsage_std__dlm data model object is not provisioned. Session tracing is available separately. Check the org\'s Agentforce usage ingestion setup in Data Cloud.',
+    })
+  }
   res.status(500).json({ error: err.message, records: [] })
 }
 
@@ -225,11 +233,60 @@ app.get('/api/orgs/:org/sessions', async (req, res) => {
       `SELECT ssot__Id__c, ssot__StartTimestamp__c, ssot__EndTimestamp__c,
               ssot__AiAgentChannelType__c, ssot__AiAgentSessionEndType__c,
               ssot__SessionOwnerId__c, ssot__SessionOwnerObject__c,
-              ssot__ExternalSourceId__c, ssot__VariableText__c, ssot__InternalOrganizationId__c,
+              ssot__ExternalSourceId__c, ssot__VariableText__c,
               ssot__PreviousSessionId__c
        FROM ssot__AiAgentSession__dlm ORDER BY ssot__StartTimestamp__c DESC LIMIT ${limit}`
     )
     res.json(result)
+  } catch (err) { handleDcError(err, res) }
+})
+
+app.get('/api/orgs/:org/sessions/:sessionId/logs', async (req, res) => {
+  const sessionId = req.params.sessionId.replaceAll("'", "''")
+  try {
+    res.json(await dcQueryAll(req.params.org,
+      `SELECT Id__c, AiAgentSessionId__c, AiAgentInteractionId__c, AiAgentInteractionStepId__c,
+              LogDateTime__c, LogLevelType__c, Category__c, Code__c,
+              Description__c, DetailedDescription__c, CauseLogId__c, RootCauseLogId__c,
+              TelemetryTrace__c, TelemetryTraceSpanId__c
+       FROM AiAgentSessionLog_std__dlm
+       WHERE AiAgentSessionId__c = '${sessionId}' ORDER BY LogDateTime__c ASC`
+    ))
+  } catch (err) { handleDcError(err, res) }
+})
+
+app.get('/api/orgs/:org/sessions/:sessionId/moments', async (req, res) => {
+  const sessionId = req.params.sessionId.replaceAll("'", "''")
+  try {
+    const [moments, interactions, evaluations] = await Promise.all([
+      dcQueryAll(req.params.org,
+        `SELECT ssot__Id__c, ssot__AiAgentSessionId__c, ssot__AiAgentApiName__c,
+                ssot__StartTimestamp__c, ssot__EndTimestamp__c,
+                ssot__RequestSummaryText__c, ssot__ResponseSummaryText__c
+         FROM ssot__AiAgentMoment__dlm
+         WHERE ssot__AiAgentSessionId__c = '${sessionId}' ORDER BY ssot__StartTimestamp__c ASC`
+      ),
+      dcQueryAll(req.params.org,
+        `SELECT link.ssot__Id__c, link.ssot__AiAgentMomentId__c, link.ssot__AiAgentInteractionId__c
+         FROM ssot__AiAgentMomentInteraction__dlm link
+         JOIN ssot__AiAgentMoment__dlm moment ON moment.ssot__Id__c = link.ssot__AiAgentMomentId__c
+         WHERE moment.ssot__AiAgentSessionId__c = '${sessionId}'`
+      ),
+      dcQueryAll(req.params.org,
+        `SELECT association.ssot__Id__c, association.ssot__AiAgentMomentId__c,
+                association.ssot__AiAgentInteractionId__c, association.ssot__IsPassed__c,
+                association.ssot__AssociationReasonText__c, association.ValueText__c,
+                association.OutcomeType__c, association.ssot__CreatedDate__c,
+                tag.ssot__Value__c AS TagValue, tag.ssot__Description__c AS TagDescription,
+                definition.ssot__Name__c AS TagName, definition.ssot__DataType__c AS TagDataType
+         FROM ssot__AiAgentTagAssociation__dlm association
+         LEFT JOIN ssot__AiAgentTag__dlm tag ON tag.ssot__Id__c = association.ssot__AiAgentTagId__c
+         LEFT JOIN ssot__AiAgentTagDefinition__dlm definition ON definition.ssot__Id__c = tag.ssot__AiAgentTagDefinitionId__c
+         WHERE association.ssot__AiAgentSessionId__c = '${sessionId}'
+         ORDER BY association.ssot__CreatedDate__c ASC`
+      ),
+    ])
+    res.json({ moments: moments.records, interactions: interactions.records, evaluations: evaluations.records })
   } catch (err) { handleDcError(err, res) }
 })
 
